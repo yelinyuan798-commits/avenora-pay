@@ -1,0 +1,25 @@
+# Internal integration contract
+
+Node 24+ ESM, built-in node:sqlite, Express. HTTP serves `dist` SPA and JSON. API JSON errors `{error:{code,message}}`. Default binding 127.0.0.1:8787. Persistent data ignored `data/`. No real wallet/private credentials seeded. Demo mode explicitly flagged server-side, cannot settle live orders. Cookie authentication and server-side tenant authorization.
+
+Frontend endpoint contract: merchant data endpoints require a merchant session. Authentication entry points, `/api/auth/me` and `/api/registry` are public; production demo mode further restricts account creation and live access. Public checkout endpoints use scoped checkout tokens.
+- GET /api/auth/me -> `{user:null|{id,email,name}, mode:'demo'|'live'}`.
+- POST /api/auth/register `{email,password,name}`; POST /api/auth/login `{email,password}`; POST /api/auth/logout; POST /api/auth/demo creates/logs into isolated demo merchant for local preview.
+- GET /api/dashboard -> `{stats:{total_volume,paid_orders,pending_orders,success_rate},chart:[{date,amount}],recent_orders:[],chains:[],mode}`.
+- GET /api/projects -> `{projects:[{id,name,description,webhook_url,created_at}]}`; POST /api/projects `{name,description,webhook_url?}`; PATCH /api/projects/:id.
+- GET /api/orders?status=&q=&project_id= -> `{orders:[],total}`; POST /api/orders `{project_id,fiat_amount,fiat_currency,chain?,token_id?,merchant_order_id?,product_id?}` -> order; POST /api/orders/:id/cancel; POST /api/orders/:id/simulate `{confirmations?:integer}` ONLY isolated demo.
+- order fields: `order_id,project_id,project_name,merchant_order_id,fiat_amount,fiat_currency,status,chain,token_id,pay_address,payable_amount,created_at,expires_at,confirmations,required_confirmations,tx_hash,checkout_url,checkout_token,delivery?`.
+- GET /api/addresses -> `{addresses:[]}`; POST /api/addresses `{project_id,chain,address,label?,token_ids?}`; PATCH /api/addresses/:id `{enabled:boolean}`.
+- GET /api/keys -> `{keys:[{id,key_id,key_prefix,project_id,name,created_at,revoked}]}`; POST /api/keys `{project_id,name}` -> `{key_id,secret,key_prefix}` (show once); DELETE /api/keys/:id.
+- GET /api/webhooks -> `{deliveries:[],endpoints:[]}`; POST /api/webhooks `{project_id,url}` -> `{id,secret}`; POST /api/webhooks/:id/retry; POST /api/webhooks/test `{project_id}`.
+- GET /api/transactions -> `{transactions:[]}` including unmatched; POST /api/transactions/:id/claim `{order_id}` only exact approved project ownership and confirmed valid funds.
+- GET /api/products -> `{products:[{id,project_id,name,price,currency,stock}]}`; POST /api/products `{project_id,name,price,currency}`; POST /api/products/:id/inventory `{items:string[]}`. Delivery visible only after paid, atomic one-use item allocation.
+- GET /api/settings -> `{name,email,mode}`; PATCH /api/settings `{name}`.
+- GET /api/registry public -> `{chains:[{id,name,family,confirmations,tokens:[{id,symbol,decimals}],configured:boolean}],currencies:[]}`.
+- GET /checkout/:token/state JSON, GET /checkout/:token/methods JSON, POST /checkout/:token/select `{chain,token_id}`. SPA page /checkout/:token. State strictly public cropped data; include `mode,product_name,delivery` for demo store checkout, no metadata or credentials. Frontend polls at >=5 sec.
+
+UI routes: /, /pricing, /docs, /about, /merchant/login, /merchant/register, /merchant/dashboard, /merchant/projects, /merchant/orders, /merchant/addresses, /merchant/keys, /merchant/webhooks, /merchant/transactions, /merchant/products, /merchant/settings, /checkout/:token.
+
+Original compatible external API: signed /v1/whoami, /v1/orders GET/POST, /v1/orders/:id GET, /v1/orders/:id/cancel POST. Canonical string METHOD\nPATH\nSORTED_QUERY\nSHA256_BODY\nTIMESTAMP\nNONCE, HMAC SHA256 hex, DJP-Key-ID/Timestamp/Nonce/Signature. Webhook envelope event_id,event_type,event_version:'v1',created_at,data; signature HMAC(secret,timestamp+'.'+raw_body), DJP-Webhook-ID/Timestamp/Signature. Nonce replay and project-scoped idempotency enforced.
+
+Chain scanner module `server/chains.mjs` exports `registry`, `validateAddress(chain,address)`, `scanChain({chain,addresses,fromBlock,toBlock,config,fetchImpl?}) -> {transactions:[{id,chain,token_id,tx_hash,event_index,to_address,from_address,amount_atomic,block_height,block_hash,block_time,confirmations,confirmed,removed}],cursor,head}`. config from server-only JSON file/env; token contracts/mints/decimals explicitly configured and validated. Never trust symbols, external POSTs or browser state to settle live. Scanning includes persisted cursor, receipt success, canonical block, dedup tx+event, valid time window. Adapter errors leave cursor unchanged. Unsupported/unconfigured methods fail closed. The backend owns worker orchestration, scanner only network decoding.
