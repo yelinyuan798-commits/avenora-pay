@@ -127,3 +127,22 @@ test('refund cumulative cap uses token integer precision and ignores voided reco
   const pending = e.store.createOrder(e.a, { project_id: e.pa.id, fiat_amount: '1', chain: 'bsc', token_id: 'bsc-usdt' });
   assert.equal((await e.req('/api/refunds', { merchant: e.a, body: { order_id: pending.order_id, amount: '1', tx_hash: 'refund-pending-test' } })).body.error.code, 'ORDER_NOT_PAID');
 });
+
+test('refund records cannot include a waived fingerprint or assume a missing receipt', async t => {
+  const e = await environment(t);
+  e.store.config.payments = { allowFingerprintUnderpayment: true };
+  const order = e.store.createOrder(e.a, { project_id:e.pa.id, fiat_amount:'1.00', fiat_currency:'USD', chain:'bsc', token_id:'bsc-usdt' });
+  const paid = e.store.ingest({chain:'bsc',token_id:'bsc-usdt',to_address:order.pay_address,from_address:'demo:payer',
+    tx_hash:'demo-refund-tolerance',event_index:0,amount_atomic:decimalAtomic('1',18).toString(),
+    block_height:100,block_hash:'demo-block',block_time:new Date(Date.now()+2000).toISOString(),
+    confirmations:15,confirmed:true,removed:false},{mode:'demo'}).order;
+  assert.equal(paid.received_amount,'1.0');
+  assert.notEqual(paid.payable_amount,paid.received_amount);
+  const refund = (amount, suffix) => e.req('/api/refunds',{merchant:e.a,body:{order_id:order.order_id,amount,tx_hash:'refund-tolerance-'+suffix}});
+  assert.equal((await refund(order.payable_amount,'over-single')).status,400);
+  assert.equal((await refund('0.6','first')).status,201);
+  assert.equal((await refund('0.400000000000000001','over-total')).body.error.code,'REFUND_EXCEEDS_PAYMENT');
+  assert.equal((await refund('0.4','remaining')).status,201);
+  e.store.run('UPDATE orders SET transfer_id=NULL WHERE order_id=?',order.order_id);
+  assert.equal((await refund('0.1','missing')).body.error.code,'PAYMENT_RECEIPT_MISSING');
+});
