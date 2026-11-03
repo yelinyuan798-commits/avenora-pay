@@ -1,0 +1,35 @@
+{
+  "name": "avenora-pay",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server/index.mjs",
+    "start": "NODE_ENV=production node server/index.mjs",
+    "build": "vite build",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "lucide-react": "^0.468.0",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "vite": "^7.0.0"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "description": "Self-hosted non-custodial crypto payments, automatic digital delivery and merchant subscriptions.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yelinyuan798-commits/avenora-pay.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yelinyuan798-commits/avenora-pay/issues"
+  },
+  "homepage": "https://github.com/yelinyuan798-commits/avenora-pay#readme"
+}

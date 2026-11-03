@@ -1,0 +1,16 @@
+node_modules/
+dist/
+data/
+.env
+.env.*
+!.env.example
+*.log
+*.sqlite*
+*.db
+*.db-*
+*.key
+*.pem
+*.p12
+*.pfx
+.DS_Store
+coverage/

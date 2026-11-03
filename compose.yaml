@@ -1,0 +1,18 @@
+services:
+  payments:
+    build: .
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      APP_MODE: live
+      MASTER_KEY: ${MASTER_KEY:?Set a private 64-character hex master key}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?Set your HTTPS public origin}
+      CHAIN_CONFIG_PATH: /app/data/chains.json
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - payment-data:/app/data
+      - ./data/chains.json:/app/data/chains.json:ro
+    stop_grace_period: 20s
+volumes:
+  payment-data:
