@@ -3550,6 +3550,11 @@ function Transactions() {
                       >
                         {t.order_id || t.matched_order_id ? "已匹配" : "未匹配"}
                       </Badge>
+                      {t.reason === "ambiguous_amount" && (
+                        <small className="cell-sub transaction-match-reason">
+                          金额对应多笔订单，待人工核对
+                        </small>
+                      )}
                     </td>
                     <td>
                       {!t.order_id && !t.matched_order_id && (
@@ -4076,6 +4081,20 @@ function Checkout({ token }) {
     .toString()
     .padStart(2, "0")}:${(remaining % 60).toString().padStart(2, "0")}`;
   const isBscUsdt = data?.chain === "bsc" && tokenSymbol(data) === "USDT";
+  // The server supplies the exact lower bound; never derive it by rounding the quote.
+  const tolerance = data?.payment_tolerance;
+  const paymentTolerance =
+    tolerance?.enabled === true &&
+    tolerance.kind === "fingerprint_only" &&
+    tolerance.requires_unique_order === true &&
+    typeof tolerance.minimum_amount === "string" &&
+    /^\d+(?:\.\d+)?$/.test(tolerance.minimum_amount)
+      ? tolerance
+      : null;
+  const receivedAmount =
+    typeof data?.received_amount === "string" && data.received_amount !== ""
+      ? data.received_amount
+      : null;
   const paymentWindowClosed =
     (["pending", "awaiting_payment"].includes(data?.status) &&
       Boolean(end) &&
@@ -4250,6 +4269,14 @@ function Checkout({ token }) {
                           ? "商户已人工核对并确认订单，以下是本次处理结果。"
                           : "感谢付款，收款结果已通知商户。"}
                   </p>
+                  {receivedAmount !== null && (
+                    <div className="checkout-received-amount">
+                      <span>实际到账</span>
+                      <strong>
+                        {displayAmount(receivedAmount)} {tokenSymbol(data)}
+                      </strong>
+                    </div>
+                  )}
                   {invoice ? (
                     <div className="checkout-subscription-result">
                       <div className="checkout-receipt">
@@ -4384,7 +4411,9 @@ function Checkout({ token }) {
               ) : (
                 <>
                   <div className="checkout-amount-box">
-                    <small>必须实际到账</small>
+                    <small>
+                      {paymentTolerance ? "订单应付金额" : "必须实际到账"}
+                    </small>
                     <h1 className="checkout-payable">
                       <span className="exact-token-amount">
                         {displayAmount(data.payable_amount)}
@@ -4397,50 +4426,85 @@ function Checkout({ token }) {
                         />
                       </span>
                     </h1>
-                    {isBscUsdt && (
+                    {paymentTolerance && (
+                      <div className="checkout-minimum-amount">
+                        <span>允许省略识别尾数，最低到账</span>
+                        <strong>
+                          {displayAmount(paymentTolerance.minimum_amount)}{" "}
+                          {tokenSymbol(data)}
+                        </strong>
+                      </div>
+                    )}
+                    {!paymentTolerance && isBscUsdt && (
                       <p className="checkout-exact-match">
                         实际到账金额必须与上方绿色数字完全一致
                       </p>
                     )}
-                    <div className="checkout-arrival-note">
-                      <b>不要多转，也不要少转</b>
-                      {isBscUsdt ? (
+                    {paymentTolerance ? (
+                      <div className="checkout-arrival-note">
+                        <b>仅可省略本单的小额识别尾数</b>
                         <p>
-                          {"扣除交易所提现手续费后，收款地址必须实际收到 "}
-                          <strong>
-                            {displayAmount(data.payable_amount)} USDT
-                          </strong>
-                          {
-                            "，“预计到账”须与上方金额完全一致。若手续费从提现数量中扣除，请增加发送数量；例如使用币安提现，若本次从发送数量中扣除 0.1 USDT，就在应到账数量上多发送 0.1 USDT，具体以本次提现页面显示的实际手续费为准。链上钱包的Gas使用BNB单独支付，不会从USDT金额中扣除。"
-                          }
+                          订单本金和商户手续费仍须足额到账。建议按完整应付金额支付，便于识别订单。
                         </p>
-                      ) : (
-                        <>
+                        <p>
+                          {
+                            "提币时请核对“预计到账”：如平台从转出金额中扣除手续费，扣费后的实际到账金额不能低于 "
+                          }
+                          <strong>
+                            {displayAmount(paymentTolerance.minimum_amount)}{" "}
+                            {tokenSymbol(data)}
+                          </strong>
+                          {"，也不要超过订单应付金额。"}
+                        </p>
+                        <p>若该到账金额对应多笔订单，需由商户核对处理。</p>
+                        {data.chain === "bsc" && (
                           <p>
-                            {"本单收款地址必须实际收到 "}
-                            <strong>
-                              {displayAmount(data.payable_amount)}{" "}
-                              {tokenSymbol(data)}
-                            </strong>
-                            {"，到账数量须完全一致。"}
+                            使用普通 BSC 链上钱包转账时，Gas 用 BNB 另付，请预留
+                            BNB。
                           </p>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="checkout-arrival-note">
+                        <b>不要多转，也不要少转</b>
+                        {isBscUsdt ? (
                           <p>
+                            {"扣除交易所提现手续费后，收款地址必须实际收到 "}
+                            <strong>
+                              {displayAmount(data.payable_amount)} USDT
+                            </strong>
                             {
-                              "交易所提现时，确认“预计到账”与应付数量一致；若手续费从提现数量中扣除，请增加发送数量，让扣费后的到账数量准确匹配。"
+                              "，“预计到账”须与上方金额完全一致。若手续费从提现数量中扣除，请增加发送数量；例如使用币安提现，若本次从发送数量中扣除 0.1 USDT，就在应到账数量上多发送 0.1 USDT，具体以本次提现页面显示的实际手续费为准。链上钱包的Gas使用BNB单独支付，不会从USDT金额中扣除。"
                             }
                           </p>
-                          {data.chain === "bsc" && (
+                        ) : (
+                          <>
+                            <p>
+                              {"本单收款地址必须实际收到 "}
+                              <strong>
+                                {displayAmount(data.payable_amount)}{" "}
+                                {tokenSymbol(data)}
+                              </strong>
+                              {"，到账数量须完全一致。"}
+                            </p>
                             <p>
                               {
-                                "使用普通 BSC 链上钱包转账时，Gas 用 BNB 另付，请预留 BNB，不要从应付 "
+                                "交易所提现时，确认“预计到账”与应付数量一致；若手续费从提现数量中扣除，请增加发送数量，让扣费后的到账数量准确匹配。"
                               }
-                              {tokenSymbol(data)}
-                              {" 中扣减。"}
                             </p>
-                          )}
-                        </>
-                      )}
-                    </div>
+                            {data.chain === "bsc" && (
+                              <p>
+                                {
+                                  "使用普通 BSC 链上钱包转账时，Gas 用 BNB 另付，请预留 BNB，不要从应付 "
+                                }
+                                {tokenSymbol(data)}
+                                {" 中扣减。"}
+                              </p>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    )}
                   </div>
                   <div className="checkout-qr-block">
                     <QR value={data.pay_address} demo={isDemo} size={164} />
@@ -4603,6 +4667,15 @@ function Checkout({ token }) {
                         <dt>完整应付金额</dt>
                         <dd>
                           {displayAmount(data.payable_amount)}{" "}
+                          {tokenSymbol(data)}
+                        </dd>
+                      </div>
+                    )}
+                    {paymentTolerance && (
+                      <div>
+                        <dt>最低到账金额</dt>
+                        <dd>
+                          {displayAmount(paymentTolerance.minimum_amount)}{" "}
                           {tokenSymbol(data)}
                         </dd>
                       </div>
