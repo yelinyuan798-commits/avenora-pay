@@ -4075,8 +4075,19 @@ function Checkout({ token }) {
   const time = `${Math.floor(remaining / 60)
     .toString()
     .padStart(2, "0")}:${(remaining % 60).toString().padStart(2, "0")}`;
+  const isBscUsdt = data?.chain === "bsc" && tokenSymbol(data) === "USDT";
+  const paymentWindowClosed =
+    (["pending", "awaiting_payment"].includes(data?.status) &&
+      Boolean(end) &&
+      remaining === 0) ||
+    (data?.status === "pending" &&
+      Boolean(data?.chain) &&
+      data?.payable === false);
+  const needsMethod =
+    data?.status === "awaiting_payment" ||
+    (data?.status === "pending" && !data?.chain);
   return (
-    <div className="checkout-page">
+    <div className="checkout-page checkout-page-refined">
       <header>
         <Logo />
         <span>
@@ -4135,31 +4146,47 @@ function Checkout({ token }) {
             )}
             <section className="checkout-panel">
               <div className="checkout-panel-head">
-                <div>
-                  <small>{invoice ? "订阅金额" : "订单金额"}</small>
-                  <h1>
-                    <Money
-                      value={data.fiat_total || data.fiat_amount}
-                      currency={data.fiat_currency}
-                    />
-                  </h1>
-                  {Number(data.fee_amount) > 0 && (
-                    <small className="checkout-fee-note">
-                      含手续费{" "}
+                {data.chain ? (
+                  <span className="network-pill">
+                    <ChainIcon chain={data.chain} size={20} />
+                    <span className="checkout-network-name">
+                      {isBscUsdt
+                        ? "USDT-BEP20 · BNB Smart Chain（BSC）"
+                        : CHAIN_NAMES[data.chain] || data.chain}
+                    </span>
+                    {!isBscUsdt && (
+                      <span className="checkout-network-caption">网络</span>
+                    )}
+                  </span>
+                ) : (
+                  <div className="checkout-fiat-heading">
+                    <small>{invoice ? "订阅金额" : "订单金额"}</small>
+                    <h1>
                       <Money
-                        value={data.fee_amount}
+                        value={data.fiat_total || data.fiat_amount}
                         currency={data.fiat_currency}
                       />
-                      （{data.fee_percent}%）
-                    </small>
-                  )}
-                </div>
-                <Badge status={data.status} />
+                    </h1>
+                  </div>
+                )}
+                <Badge
+                  status={
+                    paymentWindowClosed
+                      ? "expired"
+                      : data.status === "review"
+                        ? "recorded"
+                        : data.status
+                  }
+                >
+                  {paymentWindowClosed
+                    ? "已到付款截止"
+                    : data.status === "review"
+                      ? "付款待核对"
+                      : undefined}
+                </Badge>
               </div>
               <InlineError error={error} />
-              <PriceSnapshot order={data} />
-              {data.status === "awaiting_payment" ||
-              (data.status === "pending" && !data.chain) ? (
+              {needsMethod && !paymentWindowClosed ? (
                 <div className="method-selection">
                   <h2>选择支付网络与币种</h2>
                   <p>
@@ -4219,7 +4246,9 @@ function Checkout({ token }) {
                         : "已确认收款，正在核对账单并更新订阅状态。"
                       : isDemo
                         ? "演示到账已完成，以下是本次流程的结果。"
-                        : "感谢付款，收款结果已通知商户。"}
+                        : data.paid_source === "manual"
+                          ? "商户已人工核对并确认订单，以下是本次处理结果。"
+                          : "感谢付款，收款结果已通知商户。"}
                   </p>
                   {invoice ? (
                     <div className="checkout-subscription-result">
@@ -4274,39 +4303,147 @@ function Checkout({ token }) {
                     </div>
                   )}
                 </div>
-              ) : ["expired", "canceled"].includes(data.status) ? (
+              ) : data.status === "confirming" ? (
+                <div className="checkout-closed checkout-confirming">
+                  <span>
+                    <Radio size={30} />
+                  </span>
+                  <h2>正在等待链上确认</h2>
+                  <p>
+                    已检测到付款，请勿重复转账。达到所需确认数后，本页会自动更新结果。
+                  </p>
+                  <div className="checkout-progress">
+                    <div>
+                      <span>链上确认进度</span>
+                      <b>
+                        {data.confirmations || 0} /{" "}
+                        {data.required_confirmations || "—"}
+                      </b>
+                    </div>
+                    <div className="progress-track">
+                      <i
+                        style={{
+                          width: `${Math.min(100, ((data.confirmations || 0) / (data.required_confirmations || 1)) * 100)}%`,
+                        }}
+                      />
+                    </div>
+                  </div>
+                  {data.chain === "bitcoin" && (
+                    <p>
+                      交易已进入区块，继续等待{" "}
+                      {data.required_confirmations || 6}{" "}
+                      次确认；确认过程可以超过付款窗口，无需再次付款。
+                    </p>
+                  )}
+                  {data.tx_hash && (
+                    <div className="checkout-tx">
+                      <small>交易哈希</small>
+                      <code>{clip(data.tx_hash, 16)}</code>
+                      <CopyButton value={data.tx_hash} label="复制交易哈希" />
+                    </div>
+                  )}
+                </div>
+              ) : data.status === "review" ? (
+                <div className="checkout-closed checkout-review">
+                  <span>
+                    <Clock3 size={30} />
+                  </span>
+                  <h2>付款待核对</h2>
+                  <p>
+                    已收到付款记录，请勿重复转账。商户正在核对处理，本页会自动更新结果。
+                  </p>
+                  {data.tx_hash && (
+                    <div className="checkout-tx">
+                      <small>交易哈希</small>
+                      <code>{clip(data.tx_hash, 16)}</code>
+                      <CopyButton value={data.tx_hash} label="复制交易哈希" />
+                    </div>
+                  )}
+                </div>
+              ) : paymentWindowClosed ||
+                ["expired", "canceled"].includes(data.status) ? (
                 <div className="checkout-closed">
                   <span>
                     <Clock3 size={30} />
                   </span>
                   <h2>
-                    {data.status === "expired" ? "订单已过期" : "订单已取消"}
+                    {paymentWindowClosed
+                      ? "已到付款截止，请勿转账"
+                      : data.status === "expired"
+                        ? "订单已过期"
+                        : "订单已取消"}
                   </h2>
                   <p>
-                    {invoice
-                      ? "请返回套餐页面重新创建订阅账单，不要继续向此订单转账。"
-                      : "请返回商户页面重新创建订单，不要继续向此订单转账。"}
+                    {paymentWindowClosed
+                      ? "请勿继续向此订单转账。若已付款，请保留交易哈希并联系商户核对；本页会自动更新处理状态。"
+                      : invoice
+                        ? "请返回套餐页面重新创建订阅账单，不要继续向此订单转账。"
+                        : "请返回商户页面重新创建订单，不要继续向此订单转账。"}
                   </p>
                 </div>
               ) : (
                 <>
                   <div className="checkout-amount-box">
-                    <span className="network-pill">
-                      <ChainIcon chain={data.chain} size={17} />
-                      网络：{CHAIN_NAMES[data.chain] || data.chain}
-                    </span>
-                    <small>请准确支付以下金额</small>
-                    <strong>
+                    <small>必须实际到账</small>
+                    <h1 className="checkout-payable">
                       <span className="exact-token-amount">
                         {displayAmount(data.payable_amount)}
                       </span>
-                      <em>{tokenSymbol(data)}</em>
-                      <CopyButton value={data.payable_amount} />
-                    </strong>
-                    <p>保留所有小数位，金额用于识别你的订单</p>
+                      <span className="checkout-payable-unit">
+                        <em>{tokenSymbol(data)}</em>
+                        <CopyButton
+                          value={data.payable_amount}
+                          label="复制完整应付金额"
+                        />
+                      </span>
+                    </h1>
+                    {isBscUsdt && (
+                      <p className="checkout-exact-match">
+                        实际到账金额必须与上方绿色数字完全一致
+                      </p>
+                    )}
+                    <div className="checkout-arrival-note">
+                      <b>不要多转，也不要少转</b>
+                      {isBscUsdt ? (
+                        <p>
+                          {"扣除交易所提现手续费后，收款地址必须实际收到 "}
+                          <strong>
+                            {displayAmount(data.payable_amount)} USDT
+                          </strong>
+                          {
+                            "，“预计到账”须与上方金额完全一致。若手续费从提现数量中扣除，请增加发送数量；例如使用币安提现，若本次从发送数量中扣除 0.1 USDT，就在应到账数量上多发送 0.1 USDT，具体以本次提现页面显示的实际手续费为准。链上钱包的Gas使用BNB单独支付，不会从USDT金额中扣除。"
+                          }
+                        </p>
+                      ) : (
+                        <>
+                          <p>
+                            {"本单收款地址必须实际收到 "}
+                            <strong>
+                              {displayAmount(data.payable_amount)}{" "}
+                              {tokenSymbol(data)}
+                            </strong>
+                            {"，到账数量须完全一致。"}
+                          </p>
+                          <p>
+                            {
+                              "交易所提现时，确认“预计到账”与应付数量一致；若手续费从提现数量中扣除，请增加发送数量，让扣费后的到账数量准确匹配。"
+                            }
+                          </p>
+                          {data.chain === "bsc" && (
+                            <p>
+                              {
+                                "使用普通 BSC 链上钱包转账时，Gas 用 BNB 另付，请预留 BNB，不要从应付 "
+                              }
+                              {tokenSymbol(data)}
+                              {" 中扣减。"}
+                            </p>
+                          )}
+                        </>
+                      )}
+                    </div>
                   </div>
                   <div className="checkout-qr-block">
-                    <QR value={data.pay_address} demo={isDemo} size={168} />
+                    <QR value={data.pay_address} demo={isDemo} size={164} />
                     <span>
                       {isDemo
                         ? "演示二维码，不可用于转账"
@@ -4317,7 +4454,10 @@ function Checkout({ token }) {
                     <small>收款地址</small>
                     <div>
                       <code>{data.pay_address}</code>
-                      <CopyButton value={data.pay_address} />
+                      <CopyButton
+                        value={data.pay_address}
+                        label="复制完整收款地址"
+                      />
                     </div>
                   </div>
                   <div className="checkout-progress">
@@ -4348,43 +4488,133 @@ function Checkout({ token }) {
                         }}
                       />
                     </div>
+                    {data.expires_at && (
+                      <p className="checkout-deadline">
+                        {data.status === "confirming"
+                          ? "本单付款截止"
+                          : "付款截止"}
+                        ：
+                        {new Date(data.expires_at).toLocaleString("zh-CN", {
+                          month: "2-digit",
+                          day: "2-digit",
+                          hour: "2-digit",
+                          minute: "2-digit",
+                          second: "2-digit",
+                          hour12: false,
+                        })}
+                      </p>
+                    )}
                   </div>
                   <div className="checkout-instructions">
-                    <b>付款须知</b>
-                    <ul>
-                      <li>
-                        使用 {CHAIN_NAMES[data.chain] || data.chain} 网络发送{" "}
-                        {tokenSymbol(data)}。
-                      </li>
-                      <li>确保到账金额与应付金额完全一致。</li>
-                      {[
-                        "ethereum-eth",
-                        "base-eth",
-                        "arbitrum-eth",
-                        "bsc-bnb",
-                      ].includes(data.token_id) && (
-                        <li>请使用钱包直接转账，暂不支持合约内部转账。</li>
-                      )}
-                      {data.chain === "bitcoin" && (
-                        <li>
-                          请在付款截止前让交易进入区块；入区块后继续等待{" "}
-                          {data.required_confirmations || 6}{" "}
-                          次确认，确认过程可以超过付款窗口。
-                        </li>
-                      )}
-                      <li>完成转账后，本页会自动更新支付状态。</li>
-                    </ul>
+                    {isBscUsdt ? (
+                      <p>
+                        <b>必须使用BSC链上转账：</b>
+                        {
+                          "请选择“区块链提现/链上提现”与BNB Smart Chain（BEP20）。不要使用Binance Pay、交易所内部转账、内部划转或其他网络；这类付款不会产生可扫描的BSC交易哈希，系统无法自动发货。付款记录中必须能够查看以0x开头的链上TxID。"
+                        }
+                      </p>
+                    ) : (
+                      <>
+                        <p>
+                          <b>币种和网络必须选对</b>
+                        </p>
+                        <p>
+                          {"本单网络："}
+                          {CHAIN_NAMES[data.chain] || data.chain}
+                          {
+                            "。请核对币种、网络及本单收款地址，不要跨链转账，也不要复用旧订单地址。"
+                          }
+                        </p>
+                        <p className="checkout-method-title">
+                          <b>选择链上转账或区块链提现</b>
+                        </p>
+                        <p>
+                          {
+                            "请选择“链上转账 / 区块链提现”。不要使用 Binance Pay、UID/邮箱转账、交易所内部转账或内部划转。"
+                          }
+                        </p>
+                        <p>
+                          {
+                            "付款后保留可在对应区块链浏览器查询的交易哈希（TxID）；内部转账无法通过链上记录自动确认。"
+                          }
+                        </p>
+                      </>
+                    )}
+                    {[
+                      "ethereum-eth",
+                      "base-eth",
+                      "arbitrum-eth",
+                      "bsc-bnb",
+                    ].includes(data.token_id) && (
+                      <p>请使用钱包直接转账，暂不支持合约内部转账。</p>
+                    )}
+                    {data.chain === "bitcoin" && (
+                      <p>
+                        请在付款截止前让交易进入区块；入区块后继续等待{" "}
+                        {data.required_confirmations || 6}{" "}
+                        次确认，确认过程可以超过付款窗口。
+                      </p>
+                    )}
                   </div>
                 </>
               )}
-              <div className="checkout-order-meta">
-                <span>订单号</span>
-                <code>{clip(data.order_id, 13)}</code>
-                <CopyButton value={data.order_id} />
-              </div>
+              <details className="checkout-details">
+                <summary>
+                  <span>订单明细</span>
+                  <span className="checkout-details-total">
+                    <Money
+                      value={data.fiat_total || data.fiat_amount}
+                      currency={data.fiat_currency}
+                    />
+                    <ChevronDown size={15} />
+                  </span>
+                </summary>
+                <div className="checkout-details-content">
+                  <dl>
+                    <div>
+                      <dt>订单号</dt>
+                      <dd className="checkout-detail-id">
+                        <code>{data.order_id}</code>
+                        <CopyButton value={data.order_id} label="复制订单号" />
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>{invoice ? "订阅金额" : "商品金额"}</dt>
+                      <dd>
+                        <Money
+                          value={data.fiat_amount}
+                          currency={data.fiat_currency}
+                        />
+                      </dd>
+                    </div>
+                    {Number(data.fee_amount) > 0 && (
+                      <div>
+                        <dt>商户手续费（{data.fee_percent}%）</dt>
+                        <dd>
+                          <Money
+                            value={data.fee_amount}
+                            currency={data.fiat_currency}
+                          />
+                        </dd>
+                      </div>
+                    )}
+                    {data.payable_amount && (
+                      <div>
+                        <dt>完整应付金额</dt>
+                        <dd>
+                          {displayAmount(data.payable_amount)}{" "}
+                          {tokenSymbol(data)}
+                        </dd>
+                      </div>
+                    )}
+                  </dl>
+                  <PriceSnapshot order={data} />
+                </div>
+              </details>
             </section>
             {isDemo &&
               user &&
+              !paymentWindowClosed &&
               ["pending", "confirming"].includes(data.status) && (
                 <div className="checkout-simulate">
                   <p>演示控制 · 仅当前商户可操作</p>
