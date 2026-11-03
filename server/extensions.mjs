@@ -137,7 +137,10 @@ export function registerExtensions(app, { store }) {
       const order = store.ownedOrder(merchant, req.body.order_id);
       if (order.status !== 'paid') fail('ORDER_NOT_PAID', '只能为已支付订单登记退款', 409);
       const decimals = store.tokenSpec(order.chain, order.token_id).token.decimals;
-      const { amount, atomic } = amountValue(req.body.amount, decimals, BigInt(order.payable_atomic));
+      const received = store.linkedTransfer(order);
+      if (!received) fail('PAYMENT_RECEIPT_MISSING', '订单缺少实际到账记录，需先核对', 409);
+      const receivedAtomic = BigInt(received.amount_atomic);
+      const { amount, atomic } = amountValue(req.body.amount, decimals, receivedAtomic);
       const txHash = text(req.body.tx_hash, 160, '退款交易哈希', { required: true });
       // This is a reconciliation record, not proof that an on-chain refund happened.
       if (!/^[a-zA-Z0-9:_-]{6,160}$/.test(txHash)) fail('INVALID_TX_HASH', '请填写退款交易哈希，不要填写网址');
@@ -149,7 +152,7 @@ export function registerExtensions(app, { store }) {
         return previous;
       }
       const total = store.all("SELECT amount_atomic FROM refund_records WHERE order_id=? AND status='recorded'", order.order_id).reduce((sum, row) => sum + BigInt(row.amount_atomic), 0n);
-      if (total + atomic > BigInt(order.payable_atomic)) fail('REFUND_EXCEEDS_PAYMENT', '累计有效退款金额不能超过订单实际应付金额', 409);
+      if (total + atomic > receivedAtomic) fail('REFUND_EXCEEDS_PAYMENT', '累计有效退款金额不能超过订单实际到账金额', 409);
       const refund = { id: uid('rf_'), merchant_id: merchant.id, project_id: order.project_id, order_id: order.order_id, chain: order.chain, token_id: order.token_id, amount, amount_atomic: atomic.toString(), tx_hash: canonicalHash, note, status: 'recorded', verification_status: 'unverified', created_at: nowISO(), voided_at: null };
       store.run('INSERT INTO refund_records VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)', ...Object.values(refund));
       refundEvent(refund, order);

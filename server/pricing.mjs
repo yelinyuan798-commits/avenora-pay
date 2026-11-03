@@ -281,6 +281,7 @@ export class PriceBook {
       fiat_numerator: String(fx.n),
       fiat_denominator: String(fx.d),
       usd_target_atomic: String(usdTarget),
+      base_payable_atomic: String(amount),
       fingerprint_limit_usd: fixed(budget),
     };
     return {

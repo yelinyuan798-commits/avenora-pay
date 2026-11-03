@@ -11,7 +11,7 @@ import {
 } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { PriceBook, PricingError, isKnownStable } from "./pricing.mjs";
+import { PriceBook, PricingError, isKnownStable, assetForToken, ceilDivide, USD_SCALE } from "./pricing.mjs";
 
 export class AppError extends Error {
   constructor(code, message, status = 400) {
@@ -44,6 +44,15 @@ export function formatAtomic(value, decimals = 2) {
     .padStart(decimals + 1, "0");
   return decimals ? s.slice(0, -decimals) + "." + s.slice(-decimals) : s;
 }
+const compactTokenAmount = (value, decimals) => {
+  const [whole, fraction = ""] = formatAtomic(value, decimals).split(".");
+  return whole + "." + (fraction.replace(/0+$/, "") || "0");
+};
+const snapshotInteger = (value) => {
+  if (typeof value !== "string" || !/^[1-9]\d{0,79}$/.test(value))
+    throw Error("Invalid locked price");
+  return BigInt(value);
+};
 export function passwordHash(password) {
   if (
     typeof password !== "string" ||
@@ -683,9 +692,72 @@ export class Store {
       throw e;
     }
   }
+  orderQuote(order) {
+    if (!order?.chain) return null;
+    return this.get(
+      "SELECT * FROM amount_reservations WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=? AND order_id=?",
+      order.chain, order.token_id, order.pay_address, order.payable_atomic, order.order_id,
+    );
+  }
+  fingerprintBounds(order, quote = this.orderQuote(order), { force = false } = {}) {
+    if ((!force && this.config.payments?.allowFingerprintUnderpayment !== true) ||
+        !isKnownStable(quote?.token_id || order?.token_id)) return null;
+    // Only immutable server-created quote data can establish the principal + fee floor.
+    // Missing/malformed historical data grants no underpayment tolerance.
+    try {
+      if (!quote?.pricing_json || quote.order_id !== order.order_id) return null;
+      const s = JSON.parse(quote.pricing_json);
+      const { token } = this.tokenSpec(quote.chain, quote.token_id);
+      const decimals = s.token_decimals;
+      if (!Number.isInteger(decimals) || decimals < 1 || decimals > 30 ||
+          decimals !== token.decimals || s.token_symbol !== assetForToken(quote.token_id) ||
+          !(order.mode === "demo" ? s.price_source === "demo_fixed" :
+            ["coinbase_spot", "configured_stable_parity"].includes(s.price_source))) return null;
+      const pricing = this.get("SELECT fiat_total FROM order_pricing WHERE order_id=?", order.order_id);
+      if (!pricing) return null;
+      const cents = decimalAtomic(pricing.fiat_total, 2);
+      const pn = snapshotInteger(s.price_numerator), pd = snapshotInteger(s.price_denominator);
+      const fn = snapshotInteger(s.fiat_numerator), fd = snapshotInteger(s.fiat_denominator);
+      const units = 10n ** BigInt(decimals);
+      const minimum = ceilDivide(cents * fn * pd * units, 100n * fd * pn);
+      const target = ceilDivide(cents * fn * USD_SCALE, 100n * fd);
+      const maximum = snapshotInteger(quote.payable_atomic);
+      if (cents <= 0n || minimum <= 0n || minimum > maximum ||
+          s.usd_target_atomic !== target.toString() ||
+          (s.base_payable_atomic !== undefined && s.base_payable_atomic !== minimum.toString())) return null;
+      const savedLimit = decimalAtomic(s.fingerprint_limit_usd, 18);
+      const budget = [target / 100n, USD_SCALE / 100n, savedLimit].reduce((a, b) => a < b ? a : b);
+      const value = ceilDivide(maximum * pn * USD_SCALE, units * pd);
+      if (budget < 0n || value < target || value - target > budget ||
+          (s.usd_atomic !== undefined && s.usd_atomic !== value.toString())) return null;
+      return { minimum, maximum, decimals };
+    } catch {
+      return null;
+    }
+  }
+  paymentAmountMatches(order, amount, quote = this.orderQuote(order), { force = false } = {}) {
+    const maximum = quote?.payable_atomic || order.payable_atomic;
+    if (String(amount) === maximum) return true;
+    if (!/^\d+$/.test(String(amount))) return false;
+    const bounds = this.fingerprintBounds(order, quote, { force });
+    return !!bounds && BigInt(amount) >= bounds.minimum && BigInt(amount) <= bounds.maximum;
+  }
+  linkedTransfer(order) {
+    if (!order.transfer_id) return null;
+    const tx = this.get("SELECT * FROM transfers WHERE id=?", order.transfer_id);
+    return tx && tx.order_id === order.order_id && tx.merchant_id === order.merchant_id &&
+      tx.project_id === order.project_id && tx.mode === order.mode && tx.chain === order.chain &&
+      tx.token_id === order.token_id && tx.to_address === order.pay_address ? tx : null;
+  }
+  receivedAmount(order) {
+    const tx = this.linkedTransfer(order);
+    if (!tx) return null;
+    return compactTokenAmount(BigInt(tx.amount_atomic), this.tokenSpec(order.chain, order.token_id).token.decimals);
+  }
   orderUsdAtomic(order) {
     if (!order.payable_amount || !order.chain)
       fail("PRICE_SNAPSHOT_MISSING", "订单尚无已锁定美元计价值", 409);
+    const received = order.status === "paid" ? this.linkedTransfer(order) : null;
     const reservation = this.get(
       "SELECT pricing_json FROM amount_reservations WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=?",
       order.chain,
@@ -697,8 +769,20 @@ export class Store {
       const snapshot = JSON.parse(reservation.pricing_json);
       if (!/^\d+$/.test(snapshot.usd_atomic || ""))
         fail("PRICE_SNAPSHOT_MISSING", "订单计价快照无效", 409);
+      if (received && received.amount_atomic !== order.payable_atomic) {
+        try {
+          const decimals = this.tokenSpec(order.chain, order.token_id).token.decimals;
+          if (snapshot.token_decimals !== decimals) throw Error("Invalid decimals");
+          return ceilDivide(BigInt(received.amount_atomic) * snapshotInteger(snapshot.price_numerator) * USD_SCALE,
+            10n ** BigInt(decimals) * snapshotInteger(snapshot.price_denominator));
+        } catch {
+          fail("PRICE_SNAPSHOT_MISSING", "实收金额缺少可信锁价，需管理员核对", 409);
+        }
+      }
       return BigInt(snapshot.usd_atomic);
     }
+    if (received && received.amount_atomic !== order.payable_atomic)
+      fail("PRICE_SNAPSHOT_MISSING", "实收金额缺少可信锁价，需管理员核对", 409);
     if (isKnownStable(order.token_id))
       return decimalAtomic(order.payable_amount, 18);
     fail(
@@ -1039,9 +1123,9 @@ export class Store {
       this.merchant(o.merchant_id),
       o.project_id,
     );
-    const quoteSnapshot = quote?.pricing_json
-      ? JSON.parse(quote.pricing_json)
-      : null;
+    let quoteSnapshot = null;
+    try { quoteSnapshot = quote?.pricing_json ? JSON.parse(quote.pricing_json) : null; } catch {}
+    const bounds = this.fingerprintBounds(o, quote);
     const spec =
       o.chain && o.token_id ? this.tokenSpec(o.chain, o.token_id).token : null;
     const publicPricing = quoteSnapshot
@@ -1083,6 +1167,15 @@ export class Store {
       token_id: o.token_id,
       pay_address: o.pay_address,
       payable_amount: o.payable_amount,
+      payment_tolerance: bounds ? {
+        enabled: true,
+        kind: "fingerprint_only",
+        minimum_amount: compactTokenAmount(bounds.minimum, bounds.decimals),
+        maximum_amount: o.payable_amount,
+        maximum_shortfall: compactTokenAmount(bounds.maximum - bounds.minimum, bounds.decimals),
+        requires_unique_order: true,
+      } : null,
+      received_amount: this.receivedAmount(o),
       created_at: o.created_at,
       expires_at: o.chain ? o.expires_at : null,
       selection_deadline: o.selection_deadline,
@@ -1227,6 +1320,15 @@ export class Store {
         selection_deadline: o.selection_deadline,
       },
     };
+    if (eventType === "order.paid") {
+      const received = this.linkedTransfer(o);
+      if (received) {
+        const decimals = this.tokenSpec(o.chain, o.token_id).token.decimals;
+        payload.data.received_amount = compactTokenAmount(BigInt(received.amount_atomic), decimals);
+        const waived = BigInt(o.payable_atomic) - BigInt(received.amount_atomic);
+        if (waived > 0n) payload.data.waived_fingerprint_amount = compactTokenAmount(waived, decimals);
+      }
+    }
     return this.enqueueEvent({
       merchant_id: o.merchant_id,
       project_id: o.project_id,
@@ -1245,10 +1347,11 @@ export class Store {
       );
       if (!item) {
         this.run(
-          "UPDATE orders SET status='review',tx_hash=?,transfer_id=?,confirmations=? WHERE order_id=?",
+          "UPDATE orders SET status='review',tx_hash=?,transfer_id=?,confirmations=?,paid_source=? WHERE order_id=?",
           transfer.tx_hash,
           transfer.id,
           transfer.confirmations,
+          source,
           o.order_id,
         );
         this.run(
@@ -1317,7 +1420,8 @@ export class Store {
         previous &&
         (previous.amount_atomic !== String(tx.amount_atomic) ||
           previous.to_address !== normalized ||
-          previous.token_id !== tx.token_id)
+          previous.token_id !== tx.token_id || previous.mode !== mode ||
+          previous.merchant_id !== addr.merchant_id || previous.project_id !== addr.project_id)
       )
         fail("TRANSFER_CONFLICT", "交易记录发生冲突", 409);
       const row = {
@@ -1346,16 +1450,53 @@ export class Store {
           .map(() => "?")
           .join(
             ",",
-          )}) ON CONFLICT(id) DO UPDATE SET confirmations=excluded.confirmations,confirmed=excluded.confirmed,removed=excluded.removed,block_hash=excluded.block_hash,block_height=excluded.block_height`,
+          )}) ON CONFLICT(id) DO UPDATE SET confirmations=excluded.confirmations,confirmed=excluded.confirmed,removed=excluded.removed,block_hash=excluded.block_hash,block_height=excluded.block_height,block_time=excluded.block_time`,
         ...Object.values(row),
       );
-      const o = this.get(
+      // Bindings survive reorgs. Unclaimed ambiguities cannot resolve themselves on replay.
+      let o = previous?.order_id
+        ? this.get("SELECT * FROM orders WHERE order_id=?", previous.order_id)
+        : null;
+      if (previous?.order_id && !o) fail("TRANSFER_CONFLICT", "已绑定交易的订单不存在", 409);
+      if (!o && previous?.reason === "ambiguous_amount") return { matched: false };
+      const tolerant = this.config.payments?.allowFingerprintUnderpayment === true && isKnownStable(tx.token_id);
+      if (!o && tolerant) {
+        const candidates = new Map();
+        const reservations = this.all(
+          "SELECT r.* FROM amount_reservations r JOIN orders o ON o.order_id=r.order_id WHERE r.chain=? AND r.token_id=? AND r.pay_address=? AND o.merchant_id=? AND o.project_id=? AND o.mode=?",
+          tx.chain, tx.token_id, normalized, addr.merchant_id, addr.project_id, mode,
+        );
+        for (const quote of reservations) {
+          const candidate = this.get("SELECT * FROM orders WHERE order_id=?", quote.order_id);
+          const created = Date.parse(quote.created_at || candidate.payment_started_at || candidate.created_at);
+          // Same-second uncertainty is still an attribution blocker. It must not
+          // disappear and let another order's exact amount win the ambiguity check.
+          // Actual underpayment settlement below uses the stricter millisecond start.
+          const start = Math.floor(created / 1000) * 1000;
+          if (!Number.isFinite(start) || Date.parse(row.block_time) < start ||
+              !this.paymentAmountMatches(candidate, row.amount_atomic, quote)) continue;
+          const current = candidate.chain === quote.chain && candidate.token_id === quote.token_id &&
+            candidate.pay_address === quote.pay_address && candidate.payable_atomic === quote.payable_atomic;
+          // Historical quotes remain blockers for late/repeated payments, never payable replacements.
+          if (!candidates.has(candidate.order_id) || current)
+            candidates.set(candidate.order_id, { order: candidate, current });
+        }
+        if (candidates.size > 1) {
+          this.run("UPDATE transfers SET reason='ambiguous_amount' WHERE id=?", id);
+          return { matched: false };
+        }
+        if (candidates.size === 1) {
+          const candidate = [...candidates.values()][0];
+          if (!candidate.current) {
+            this.run("UPDATE transfers SET reason='superseded_payment_method' WHERE id=?", id);
+            return { matched: false };
+          }
+          o = candidate.order;
+        }
+      }
+      if (!o) o = this.get(
         "SELECT * FROM orders WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=? AND mode=?",
-        tx.chain,
-        tx.token_id,
-        normalized,
-        String(tx.amount_atomic),
-        mode,
+        tx.chain, tx.token_id, normalized, String(tx.amount_atomic), mode,
       );
       if (!o) {
         const reserved = this.get(
@@ -1374,15 +1515,23 @@ export class Store {
       }
       if (
         o.merchant_id !== addr.merchant_id ||
-        o.project_id !== addr.project_id
+        o.project_id !== addr.project_id || o.mode !== mode
       )
         fail("TENANT_MISMATCH", "交易归属不符");
+      if (o.chain !== tx.chain || o.token_id !== tx.token_id || o.pay_address !== normalized) {
+        this.run("UPDATE transfers SET reason='superseded_payment_method' WHERE id=?", id);
+        return { matched: false };
+      }
       if (o.status === "paid") {
         if (tx.removed)
           this.run(
             "UPDATE transfers SET reason='reorg_after_payment' WHERE id=?",
             id,
           );
+        if (tolerant && o.transfer_id !== id) {
+          this.run("UPDATE transfers SET reason='duplicate_payment' WHERE id=?", id);
+          return { matched: false };
+        }
         return { matched: true, order: this.orderView(o) };
       }
       if (tx.removed) {
@@ -1394,13 +1543,7 @@ export class Store {
           );
         return { matched: false };
       }
-      const quote = this.get(
-        "SELECT created_at FROM amount_reservations WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=?",
-        o.chain,
-        o.token_id,
-        o.pay_address,
-        o.payable_atomic,
-      );
+      const quote = this.orderQuote(o);
       if (o.status === "expired") {
         this.run(
           "UPDATE transfers SET reason='expired_order_requires_review' WHERE id=?",
@@ -1409,14 +1552,11 @@ export class Store {
         return { matched: false };
       }
       const blockTime = Date.parse(tx.block_time);
+      const quoteStart = Date.parse(quote?.created_at || o.payment_started_at || o.created_at);
+      const minimumTime = row.amount_atomic !== o.payable_atomic && o.paid_source !== "manual"
+        ? quoteStart : Math.floor(quoteStart / 1000) * 1000;
       if (
-        blockTime <
-          Math.floor(
-            Date.parse(
-              quote?.created_at || o.payment_started_at || o.created_at,
-            ) / 1000,
-          ) *
-            1000 ||
+        blockTime < minimumTime ||
         blockTime > Date.parse(o.expires_at) ||
         ["canceled"].includes(o.status)
       ) {
@@ -1428,6 +1568,10 @@ export class Store {
       }
       if (previous?.order_id && previous.order_id !== o.order_id)
         fail("TRANSFER_ALREADY_USED", "此交易已被认领");
+      if (!this.paymentAmountMatches(o, row.amount_atomic, quote, { force: previous?.order_id === o.order_id })) {
+        this.run("UPDATE transfers SET reason='unmatched_amount' WHERE id=?", id);
+        return { matched: false };
+      }
       if (o.transfer_id && o.transfer_id !== id) {
         this.run(
           "UPDATE transfers SET reason='duplicate_payment' WHERE id=?",
@@ -1437,7 +1581,7 @@ export class Store {
       }
       this.run("UPDATE transfers SET order_id=? WHERE id=?", o.order_id, id);
       if (tx.confirmed && tx.confirmations >= o.required_confirmations)
-        this.settle(o, row);
+        this.settle(o, row, { source: o.paid_source === "manual" ? "manual" : "chain" });
       else {
         this.run(
           "UPDATE orders SET status='confirming',confirmations=?,tx_hash=?,transfer_id=? WHERE order_id=?",
@@ -1486,7 +1630,7 @@ export class Store {
         event_index: 0,
         to_address: o.pay_address,
         from_address: "demo:sender",
-        amount_atomic: o.payable_atomic,
+        amount_atomic: transfer?.amount_atomic || o.payable_atomic,
         block_height: 123456,
         block_hash: "demo_block",
         block_time: transfer?.block_time || nowISO(),
@@ -1506,20 +1650,14 @@ export class Store {
       );
       const o = this.ownedOrder(m, orderId);
       if (!tx) fail("NOT_FOUND", "交易不存在", 404);
-      const quote = this.get(
-        "SELECT created_at FROM amount_reservations WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=?",
-        o.chain,
-        o.token_id,
-        o.pay_address,
-        o.payable_atomic,
-      );
+      const quote = this.orderQuote(o);
       if (
         tx.project_id !== o.project_id ||
         tx.mode !== o.mode ||
         tx.chain !== o.chain ||
         tx.token_id !== o.token_id ||
         tx.to_address !== o.pay_address ||
-        tx.amount_atomic !== o.payable_atomic ||
+        !this.paymentAmountMatches(o, tx.amount_atomic, quote, { force: tx.order_id === o.order_id }) ||
         tx.removed ||
         !tx.confirmed ||
         tx.confirmations < o.required_confirmations ||
