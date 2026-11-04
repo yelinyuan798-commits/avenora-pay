@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { decodeReferenceTransfer, PAYMENT_REFERENCE_MAGIC } from './payment-reference.mjs';
 
 // All amounts remain integers. A token's display name is never proof of identity.
 const token = (chain, symbol, decimals = 6) => ({ id: `${chain}-${symbol.toLowerCase()}`, symbol, decimals, kind: 'token', priceAsset: symbol === 'USDT0' ? 'USDT' : symbol });
@@ -262,7 +263,7 @@ async function scanEvm(ctx, fromBlock, toBlock) {
   const head = num(await rpc('eth_blockNumber'));
   const [start, end] = limits(fromBlock, toBlock, head, config);
   if (end < start) return { transactions: [], cursor: start - 1, head, blocks: [], range: { from: start, to: end } };
-  const blocks = [], blockMap = new Map(), transactions = [], receipts = new Map(), nativeToken = tokens.find(t => t.kind === 'native');
+  const blocks = [], blockMap = new Map(), transactions = [], receipts = new Map(), transactionInputs = new Map(), nativeToken = tokens.find(t => t.kind === 'native');
   async function receiptFor(txHash, block) {
     if (!receipts.has(txHash)) receipts.set(txHash, await rpc('eth_getTransactionReceipt', [txHash]));
     const receipt = receipts.get(txHash);
@@ -317,6 +318,26 @@ async function scanEvm(ctx, fromBlock, toBlock) {
           const inReceipt = receipt.logs?.find(item => num(item.logIndex) === index && String(item.address).toLowerCase() === t.contract && String(item.data).toLowerCase() === String(log.data).toLowerCase() && JSON.stringify(item.topics?.map(strip)) === JSON.stringify(log.topics.map(strip)));
           if (!inReceipt || inReceipt.removed || log.removed) continue;
           const e = event(c, t, txHash, index, to, from, BigInt(log.data).toString(), height, block.hash, block.time, head - height + 1);
+          if (e && t.paymentReference === true) {
+            // The reference is evidence only when it is part of this successful,
+            // canonical direct transfer. A hash supplied by a browser is not proof.
+            if (!transactionInputs.has(txHash)) transactionInputs.set(txHash, await rpc('eth_getTransactionByHash', [txHash]));
+            const tx = transactionInputs.get(txHash);
+            if (!tx || typeof tx.input !== 'string' || !/^0x(?:[0-9a-f]{2})*$/i.test(tx.input) ||
+                String(tx.hash).toLowerCase() !== txHash || String(tx.blockHash).toLowerCase() !== block.hash ||
+                num(tx.blockNumber) !== height || num(tx.transactionIndex) !== num(receipt.transactionIndex))
+              fail('chain.reference_transaction_unavailable');
+            const decoded = decodeReferenceTransfer(tx.input);
+            if (decoded) {
+              if (String(tx.to).toLowerCase() === t.contract && String(tx.from).toLowerCase() === from &&
+                  /^0x[0-9a-f]+$/i.test(tx.value || '') && BigInt(tx.value) === 0n &&
+                  decoded.recipient === to && decoded.amount_atomic === e.amount_atomic)
+                e.payment_reference = decoded.reference;
+              else e.payment_reference_invalid = true;
+            } else if (typeof tx.input === 'string' && tx.input.toLowerCase().includes(PAYMENT_REFERENCE_MAGIC)) {
+              e.payment_reference_invalid = true;
+            }
+          }
           if (e) transactions.push(e);
         }
       }

@@ -448,6 +448,17 @@ export function createApp({
       res.status(201).json(p);
     }),
   );
+  app.get(
+    "/api/payment-policies",
+    wrap((req, res) => res.json({
+      policies: store.all("SELECT id FROM projects WHERE merchant_id=?", req.merchant.id)
+        .map(p => ({ ...store.paymentPolicy(req.merchant, p.id), available_methods: store.availableMethods(req.merchant, p.id) })),
+    })),
+  );
+  app.put(
+    "/api/projects/:id/payment-policy",
+    wrap((req, res) => res.json(store.setPaymentPolicy(req.merchant, req.params.id, req.body))),
+  );
   app.patch(
     "/api/projects/:id",
     wrap((req, res) => {
@@ -849,6 +860,20 @@ export function createApp({
       );
     }),
   );
+  app.post(
+    "/checkout/:token/demo-pay",
+    wrap((req, res) => {
+      const order = store.checkout(req.params.token);
+      if (mode !== "demo" || order.mode !== "demo")
+        fail("DEMO_ONLY", "仅演示环境的演示订单可模拟付款", 403);
+      store.expire();
+      const current = store.checkout(req.params.token);
+      if (!["pending", "confirming", "paid"].includes(current.status))
+        fail("ORDER_NOT_PAYABLE", "此订单已不能模拟付款", 409);
+      store.simulate(store.merchant(order.merchant_id), order.order_id);
+      res.json(store.orderView(store.checkout(req.params.token), { publicView: true }));
+    }),
+  );
   app.get(
     "/checkout/:token/methods",
     wrap((req, res) => {
@@ -856,7 +881,7 @@ export function createApp({
       const allowed = JSON.parse(o.metadata).allowed_methods || [];
       res.json({
         methods: store
-          .availableMethods(store.merchant(o.merchant_id), o.project_id)
+          .availableMethods(store.merchant(o.merchant_id), o.project_id, { payment_mode: o.payment_mode })
           .filter(
             (x) =>
               !allowed.length ||

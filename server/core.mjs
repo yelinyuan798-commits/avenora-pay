@@ -12,6 +12,7 @@ import {
 import fs from "node:fs";
 import path from "node:path";
 import { PriceBook, PricingError, isKnownStable, assetForToken, ceilDivide, USD_SCALE } from "./pricing.mjs";
+import { referenceMethod, encodeReferenceTransfer, isPaymentReference } from "./payment-reference.mjs";
 
 export class AppError extends Error {
   constructor(code, message, status = 400) {
@@ -171,6 +172,7 @@ export class Store {
   CREATE TABLE IF NOT EXISTS inventory(id TEXT PRIMARY KEY,product_id TEXT NOT NULL,merchant_id TEXT NOT NULL,content TEXT NOT NULL,content_hash TEXT NOT NULL,order_id TEXT UNIQUE,created_at TEXT NOT NULL,UNIQUE(product_id,content_hash));
   CREATE TABLE IF NOT EXISTS orders(order_id TEXT PRIMARY KEY,merchant_id TEXT NOT NULL,project_id TEXT NOT NULL,merchant_order_id TEXT NOT NULL,fiat_amount TEXT NOT NULL,fiat_currency TEXT NOT NULL,status TEXT NOT NULL,chain TEXT,token_id TEXT,pay_address TEXT,payable_atomic TEXT,payable_amount TEXT,created_at TEXT NOT NULL,expires_at TEXT NOT NULL,confirmations INTEGER NOT NULL DEFAULT 0,required_confirmations INTEGER NOT NULL DEFAULT 0,tx_hash TEXT,transfer_id TEXT UNIQUE,checkout_token TEXT UNIQUE NOT NULL,product_id TEXT,delivery TEXT,mode TEXT NOT NULL,request_hash TEXT NOT NULL,metadata TEXT NOT NULL DEFAULT '{}',UNIQUE(project_id,merchant_order_id),UNIQUE(chain,token_id,pay_address,payable_atomic));
   CREATE TABLE IF NOT EXISTS project_settings(project_id TEXT PRIMARY KEY,display_name TEXT NOT NULL,support_email TEXT NOT NULL DEFAULT '',logo_data_url TEXT,fee_enabled INTEGER NOT NULL DEFAULT 0,fee_percent TEXT NOT NULL DEFAULT '0.00');
+  CREATE TABLE IF NOT EXISTS project_payment_policies(project_id TEXT PRIMARY KEY,payment_mode TEXT NOT NULL DEFAULT 'amount');
   CREATE TABLE IF NOT EXISTS order_pricing(order_id TEXT PRIMARY KEY,fee_percent TEXT NOT NULL,fee_amount TEXT NOT NULL,fiat_total TEXT NOT NULL,created_at TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS amount_reservations(chain TEXT NOT NULL,token_id TEXT NOT NULL,pay_address TEXT NOT NULL,payable_atomic TEXT NOT NULL,order_id TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(chain,token_id,pay_address,payable_atomic));
   CREATE TABLE IF NOT EXISTS transfers(id TEXT PRIMARY KEY,merchant_id TEXT NOT NULL,project_id TEXT NOT NULL,chain TEXT NOT NULL,token_id TEXT NOT NULL,tx_hash TEXT NOT NULL,event_index INTEGER NOT NULL,to_address TEXT NOT NULL,from_address TEXT,amount_atomic TEXT NOT NULL,block_height INTEGER NOT NULL,block_hash TEXT NOT NULL,block_time TEXT NOT NULL,confirmations INTEGER NOT NULL,confirmed INTEGER NOT NULL,removed INTEGER NOT NULL,order_id TEXT,mode TEXT NOT NULL,reason TEXT,UNIQUE(chain,tx_hash,event_index));
@@ -214,6 +216,10 @@ export class Store {
       this.db.exec("ALTER TABLE orders ADD COLUMN payment_started_at TEXT");
     if (!columns.has("paid_source"))
       this.db.exec("ALTER TABLE orders ADD COLUMN paid_source TEXT");
+    if (!columns.has("payment_mode"))
+      this.db.exec("ALTER TABLE orders ADD COLUMN payment_mode TEXT NOT NULL DEFAULT 'amount'");
+    if (!columns.has("payment_reference"))
+      this.db.exec("ALTER TABLE orders ADD COLUMN payment_reference TEXT");
     this.db.exec(
       "UPDATE orders SET selection_deadline=expires_at,status=CASE WHEN status='pending' THEN 'awaiting_payment' ELSE status END WHERE chain IS NULL AND selection_deadline IS NULL",
     );
@@ -225,16 +231,65 @@ export class Store {
     );
     if (!quoteColumns.has("rate"))
       this.db.exec("ALTER TABLE amount_reservations ADD COLUMN rate TEXT");
-    this.db.exec(
-      "INSERT OR IGNORE INTO amount_reservations(chain,token_id,pay_address,payable_atomic,order_id,created_at) SELECT chain,token_id,pay_address,payable_atomic,order_id,COALESCE(payment_started_at,created_at) FROM orders WHERE chain IS NOT NULL",
-    );
     if (!quoteColumns.has("pricing_json"))
       this.db.exec(
         "ALTER TABLE amount_reservations ADD COLUMN pricing_json TEXT",
       );
+    if (!quoteColumns.has("payment_reference"))
+      this.db.exec("ALTER TABLE amount_reservations ADD COLUMN payment_reference TEXT");
+    if (!this.all("PRAGMA table_info(transfers)").some(c => c.name === "payment_reference"))
+      this.db.exec("ALTER TABLE transfers ADD COLUMN payment_reference TEXT");
+    if (!this.all("PRAGMA table_info(transfers)").some(c => c.name === "payment_reference_invalid"))
+      this.db.exec("ALTER TABLE transfers ADD COLUMN payment_reference_invalid INTEGER NOT NULL DEFAULT 0");
+    this.migrateReferenceConstraints();
+    this.db.exec(
+      "INSERT OR IGNORE INTO amount_reservations(chain,token_id,pay_address,payable_atomic,order_id,created_at) SELECT chain,token_id,pay_address,payable_atomic,order_id,COALESCE(payment_started_at,created_at) FROM orders WHERE chain IS NOT NULL AND payment_mode='amount'",
+    );
     this.priceBook =
       priceBook ||
       new PriceBook({ db: this.db, config: () => this.config.pricing || {} });
+  }
+  migrateReferenceConstraints() {
+    const orderSql = this.get("SELECT sql FROM sqlite_master WHERE type='table' AND name='orders'").sql;
+    const quoteSql = this.get("SELECT sql FROM sqlite_master WHERE type='table' AND name='amount_reservations'").sql;
+    const oldOrderConstraint = /,\s*UNIQUE\s*\(\s*chain\s*,\s*token_id\s*,\s*pay_address\s*,\s*payable_atomic\s*\)/i;
+    const oldQuoteConstraint = /PRIMARY KEY\s*\(\s*chain\s*,\s*token_id\s*,\s*pay_address\s*,\s*payable_atomic\s*\)/i;
+    const rebuild = (name, sql) => {
+      const objects = this.all("SELECT sql FROM sqlite_master WHERE tbl_name=? AND type IN ('index','trigger') AND sql IS NOT NULL", name);
+      const columns = this.all(`PRAGMA table_info(${name})`).map(c => '"' + c.name.replaceAll('"', '""') + '"').join(',');
+      const temporary = name + "_reference_migration";
+      // Keep every existing column, unrelated constraint, explicit index and trigger.
+      this.db.exec(`CREATE TABLE "${temporary}" ${sql.slice(sql.indexOf('('))};
+        INSERT INTO "${temporary}"(${columns}) SELECT ${columns} FROM "${name}";
+        DROP TABLE "${name}"; ALTER TABLE "${temporary}" RENAME TO "${name}";`);
+      for (const object of objects) this.db.exec(object.sql);
+    };
+    this.db.exec("PRAGMA foreign_keys=OFF");
+    try {
+      this.transaction(() => {
+        if (oldOrderConstraint.test(orderSql)) rebuild("orders", orderSql.replace(oldOrderConstraint, ""));
+        if (oldQuoteConstraint.test(quoteSql)) rebuild("amount_reservations", quoteSql.replace(oldQuoteConstraint,
+          "PRIMARY KEY(order_id,chain,token_id,pay_address,payable_atomic)"));
+        this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS orders_amount_identity ON orders(chain,token_id,pay_address,payable_atomic) WHERE payment_mode='amount';
+          CREATE UNIQUE INDEX IF NOT EXISTS orders_payment_reference ON orders(payment_reference) WHERE payment_reference IS NOT NULL;
+          CREATE UNIQUE INDEX IF NOT EXISTS reservations_amount_identity ON amount_reservations(chain,token_id,pay_address,payable_atomic) WHERE payment_reference IS NULL;
+          CREATE UNIQUE INDEX IF NOT EXISTS reservations_payment_reference ON amount_reservations(payment_reference) WHERE payment_reference IS NOT NULL;`);
+        if (this.all("PRAGMA foreign_key_check").length) throw Error("Payment reference migration failed foreign-key integrity check");
+      });
+    } finally { this.db.exec("PRAGMA foreign_keys=ON"); }
+  }
+  paymentPolicy(m, projectId) {
+    this.project(m, projectId);
+    return { project_id: projectId, payment_mode: this.get("SELECT payment_mode FROM project_payment_policies WHERE project_id=?", projectId)?.payment_mode || "amount" };
+  }
+  setPaymentPolicy(m, projectId, { payment_mode } = {}) {
+    return this.transaction(() => {
+      this.project(m, projectId);
+      if (!["amount", "reference"].includes(payment_mode)) fail("INVALID_PAYMENT_MODE", "请选择金额识别或订单号付款模式");
+      this.run("INSERT INTO project_payment_policies(project_id,payment_mode) VALUES(?,?) ON CONFLICT(project_id) DO UPDATE SET payment_mode=excluded.payment_mode", projectId, payment_mode);
+      this.audit(m.id, "payment_policy.update", projectId);
+      return this.paymentPolicy(m, projectId);
+    });
   }
   close() {
     this.db.close();
@@ -695,11 +750,12 @@ export class Store {
   orderQuote(order) {
     if (!order?.chain) return null;
     return this.get(
-      "SELECT * FROM amount_reservations WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=? AND order_id=?",
-      order.chain, order.token_id, order.pay_address, order.payable_atomic, order.order_id,
+      "SELECT * FROM amount_reservations WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=? AND order_id=? AND payment_reference IS ?",
+      order.chain, order.token_id, order.pay_address, order.payable_atomic, order.order_id, order.payment_reference || null,
     );
   }
   fingerprintBounds(order, quote = this.orderQuote(order), { force = false } = {}) {
+    if (order?.payment_mode === "reference" || quote?.payment_reference) return null;
     if ((!force && this.config.payments?.allowFingerprintUnderpayment !== true) ||
         !isKnownStable(quote?.token_id || order?.token_id)) return null;
     // Only immutable server-created quote data can establish the principal + fee floor.
@@ -747,7 +803,8 @@ export class Store {
     const tx = this.get("SELECT * FROM transfers WHERE id=?", order.transfer_id);
     return tx && tx.order_id === order.order_id && tx.merchant_id === order.merchant_id &&
       tx.project_id === order.project_id && tx.mode === order.mode && tx.chain === order.chain &&
-      tx.token_id === order.token_id && tx.to_address === order.pay_address ? tx : null;
+      tx.token_id === order.token_id && tx.to_address === order.pay_address &&
+      (tx.payment_reference || null) === (order.payment_reference || null) ? tx : null;
   }
   receivedAmount(order) {
     const tx = this.linkedTransfer(order);
@@ -758,13 +815,7 @@ export class Store {
     if (!order.payable_amount || !order.chain)
       fail("PRICE_SNAPSHOT_MISSING", "订单尚无已锁定美元计价值", 409);
     const received = order.status === "paid" ? this.linkedTransfer(order) : null;
-    const reservation = this.get(
-      "SELECT pricing_json FROM amount_reservations WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=?",
-      order.chain,
-      order.token_id,
-      order.pay_address,
-      order.payable_atomic,
-    );
+    const reservation = this.orderQuote(order);
     if (reservation?.pricing_json) {
       const snapshot = JSON.parse(reservation.pricing_json);
       if (!/^\d+$/.test(snapshot.usd_atomic || ""))
@@ -892,6 +943,8 @@ export class Store {
       ).toISOString(),
       payment_started_at: null,
       paid_source: null,
+      payment_mode: this.paymentPolicy(m, project.id).payment_mode,
+      payment_reference: null,
     };
     return this.transaction(() => {
       if (!skipLimits) this.callHook("enforceLimits", m, "orders", project.id);
@@ -929,7 +982,8 @@ export class Store {
       );
     });
   }
-  availableMethods(m, projectId) {
+  availableMethods(m, projectId, { payment_mode } = {}) {
+    const reference = (payment_mode || this.paymentPolicy(m, projectId).payment_mode) === "reference";
     return this.all(
       "SELECT * FROM addresses WHERE project_id=? AND merchant_id=? AND enabled=1 AND mode=?",
       projectId,
@@ -938,7 +992,8 @@ export class Store {
     )
       .flatMap((a) =>
         JSON.parse(a.token_ids)
-          .filter((id) => m.mode === "demo" || this.configured(a.chain, id))
+          .filter((id) => (m.mode === "demo" || this.configured(a.chain, id)) &&
+            (!reference || referenceMethod(this, a.chain, id, m.mode)))
           .map((id) => ({ chain: a.chain, token_id: id })),
       )
       .filter(
@@ -957,6 +1012,30 @@ export class Store {
         emitEvent,
       ),
     );
+  }
+  restoreReferenceQuote(order, quote, network, emitEvent) {
+    let snapshot;
+    try { snapshot = JSON.parse(quote.pricing_json); } catch {}
+    const { token } = this.tokenSpec(quote.chain, quote.token_id);
+    if (snapshot?.payment_mode !== "reference" || snapshot.token_decimals !== token.decimals ||
+        !/^0x[0-9a-f]{64}$/.test(quote.payment_reference || "") ||
+        !/^[1-9]\d*$/.test(quote.payable_atomic) || snapshot.base_payable_atomic !== quote.payable_atomic ||
+        !/^\d+$/.test(snapshot.usd_atomic || ""))
+      fail("PRICE_SNAPSHOT_MISSING", "原支付方式缺少可信锁价，无法自动恢复", 409);
+    const amount = compactTokenAmount(quote.payable_atomic, token.decimals);
+    this.callHook("enforceQuoteLimit", this.merchant(order.merchant_id), order, {
+      usd_atomic: snapshot.usd_atomic, payable_amount: amount, decimals: token.decimals,
+    });
+    const required = Math.max(Number(network.confirmations || 1),
+      Number(this.chainConfig(quote.chain)?.confirmations || 0), Number(snapshot.required_confirmations || 0));
+    // Restore the original reference and price without changing its start or deadline.
+    this.run(
+      "UPDATE orders SET status='pending',chain=?,token_id=?,pay_address=?,payable_atomic=?,payable_amount=?,payment_reference=?,required_confirmations=? WHERE order_id=?",
+      quote.chain, quote.token_id, quote.pay_address, quote.payable_atomic, amount, quote.payment_reference, required, order.order_id,
+    );
+    const updated = this.get("SELECT * FROM orders WHERE order_id=?", order.order_id);
+    if (emitEvent) this.enqueue(updated, "order.method_selected");
+    return this.orderView(updated);
   }
   _selectMethod(order, chain, tokenId, emitEvent) {
     if (!order || !["awaiting_payment", "pending"].includes(order.status))
@@ -980,6 +1059,9 @@ export class Store {
       fail("METHOD_NOT_ALLOWED", "该订单不支持此支付方式");
     const m = this.merchant(order.merchant_id);
     const { chain: network } = this.tokenSpec(chain, tokenId);
+    const reference = order.payment_mode === "reference";
+    if (reference && !referenceMethod(this, chain, tokenId, m.mode))
+      fail("REFERENCE_UNSUPPORTED", "该网络代币尚未启用订单号钱包付款", 409);
     if (m.mode !== "demo" && !this.configured(chain, tokenId))
       fail("PAYMENT_UNCONFIGURED", "该网络和代币尚未配置收款节点");
     const addresses = this.all(
@@ -990,6 +1072,13 @@ export class Store {
       m.mode,
     ).filter((a) => JSON.parse(a.token_ids).includes(tokenId));
     if (!addresses.length) fail("NO_ADDRESS", "项目尚未配置此网络的收款地址");
+    if (reference) {
+      const previous = this.all(
+        "SELECT * FROM amount_reservations WHERE order_id=? AND chain=? AND token_id=? AND payment_reference IS NOT NULL ORDER BY created_at",
+        order.order_id, chain, tokenId,
+      ).find(q => addresses.some(a => a.address === q.pay_address));
+      if (previous) return this.restoreReferenceQuote(order, previous, network, emitEvent);
+    }
     const pricing = this.get(
       "SELECT * FROM order_pricing WHERE order_id=?",
       order.order_id,
@@ -1003,8 +1092,8 @@ export class Store {
     );
     const { amount, decimals, rate, step } = quoteData;
     const base = amount;
-    let allocated, address;
-    for (const candidateAddress of addresses) {
+    let allocated = reference ? base : undefined, address = reference ? addresses[0] : undefined;
+    for (const candidateAddress of reference ? [] : addresses) {
       for (let i = 1; i <= 9999; i++) {
         const candidate = base + BigInt(i) * step;
         if (
@@ -1014,7 +1103,7 @@ export class Store {
           break;
         if (
           !this.get(
-            "SELECT order_id FROM amount_reservations WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=?",
+            "SELECT order_id FROM amount_reservations WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=? AND payment_reference IS NULL",
             chain,
             tokenId,
             candidateAddress.address,
@@ -1033,9 +1122,10 @@ export class Store {
     const usdAtomic = quoteData.usdValue(allocated);
     const snapshot = {
       ...quoteData.snapshot,
+      payment_mode: reference ? "reference" : "amount",
       usd_atomic: String(usdAtomic),
       usd_value: formatAtomic(usdAtomic, 18),
-      fingerprint_usd: formatAtomic(usdAtomic - quoteData.usdTarget, 18),
+      fingerprint_usd: formatAtomic(reference ? 0n : usdAtomic - quoteData.usdTarget, 18),
     };
     this.callHook("enforceQuoteLimit", m, order, {
       usd_atomic: String(usdAtomic),
@@ -1070,8 +1160,10 @@ export class Store {
       Number(network.confirmations || 1),
       Number(this.chainConfig(chain)?.confirmations || 0),
     );
+    snapshot.required_confirmations = required;
+    const paymentReference = reference ? "0x" + randomBytes(32).toString("hex") : null;
     this.run(
-      "INSERT INTO amount_reservations(chain,token_id,pay_address,payable_atomic,order_id,created_at,rate,pricing_json) VALUES(?,?,?,?,?,?,?,?)",
+      "INSERT INTO amount_reservations(chain,token_id,pay_address,payable_atomic,order_id,created_at,rate,pricing_json,payment_reference) VALUES(?,?,?,?,?,?,?,?,?)",
       chain,
       tokenId,
       address.address,
@@ -1080,17 +1172,19 @@ export class Store {
       selectedAt,
       rate,
       JSON.stringify(snapshot),
+      paymentReference,
     );
     this.run(
-      "UPDATE orders SET status='pending',chain=?,token_id=?,pay_address=?,payable_atomic=?,payable_amount=?,required_confirmations=?,expires_at=?,payment_started_at=COALESCE(payment_started_at,?) WHERE order_id=?",
+      "UPDATE orders SET status='pending',chain=?,token_id=?,pay_address=?,payable_atomic=?,payable_amount=?,required_confirmations=?,expires_at=?,payment_started_at=COALESCE(payment_started_at,?),payment_reference=? WHERE order_id=?",
       chain,
       tokenId,
       address.address,
       allocated.toString(),
-      formatAtomic(allocated, decimals),
+      reference ? compactTokenAmount(allocated, decimals) : formatAtomic(allocated, decimals),
       required,
       expiresAt,
       selectedAt,
+      paymentReference,
       order.order_id,
     );
     const updated = this.get(
@@ -1110,15 +1204,7 @@ export class Store {
       "SELECT * FROM order_pricing WHERE order_id=?",
       o.order_id,
     );
-    const quote = o.chain
-      ? this.get(
-          "SELECT * FROM amount_reservations WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=?",
-          o.chain,
-          o.token_id,
-          o.pay_address,
-          o.payable_atomic,
-        )
-      : null;
+    const quote = this.orderQuote(o);
     const brand = this.projectSettings(
       this.merchant(o.merchant_id),
       o.project_id,
@@ -1167,6 +1253,10 @@ export class Store {
       token_id: o.token_id,
       pay_address: o.pay_address,
       payable_amount: o.payable_amount,
+      payment_mode: o.payment_mode || "amount",
+      wallet_payment: this.walletPayment(o),
+      fulfillment_status: o.status === "review" && this.linkedTransfer(o)?.reason === "stock_unavailable"
+        ? "waiting_stock" : null,
       payment_tolerance: bounds ? {
         enabled: true,
         kind: "fingerprint_only",
@@ -1208,6 +1298,19 @@ export class Store {
         checkout_url: "/checkout/" + o.checkout_token,
       });
     return view;
+  }
+  walletPayment(order) {
+    if (order.payment_mode !== "reference" || order.mode === "demo" || !order.payment_reference || !this.orderQuote(order)) return null;
+    const method = referenceMethod(this, order.chain, order.token_id, order.mode);
+    if (!method?.contract) return null;
+    const { token } = this.tokenSpec(order.chain, order.token_id);
+    return {
+      chain_id: "0x" + BigInt(method.chainId).toString(16), to: method.contract, value: "0x0",
+      data: encodeReferenceTransfer({ recipient: order.pay_address, amountAtomic: order.payable_atomic, reference: order.payment_reference }),
+      recipient: order.pay_address, token_symbol: token.symbol, token_decimals: token.decimals,
+      amount: order.payable_amount, amount_atomic: order.payable_atomic,
+      reference: order.payment_reference, expires_at: order.expires_at,
+    };
   }
   ownedOrder(m, id, projectId) {
     const o = this.get(
@@ -1416,6 +1519,15 @@ export class Store {
         fail("INVALID_TRANSFER", "无效链上记录");
       const id = hash([tx.chain, tx.tx_hash, tx.event_index].join(":"));
       const previous = this.get("SELECT * FROM transfers WHERE id=?", id);
+      const suppliedReference = tx.payment_reference ?? null;
+      const validReference = isPaymentReference(suppliedReference);
+      const paymentReference = validReference ? suppliedReference.toLowerCase() : null;
+      const invalidReference = tx.payment_reference_invalid === true || tx.payment_reference_invalid === 1 ||
+        (suppliedReference !== null && !validReference) || !!previous?.payment_reference_invalid;
+      if (previous && ((previous.payment_reference && previous.payment_reference !== paymentReference) ||
+          (previous.order_id && !previous.payment_reference && paymentReference) ||
+          (invalidReference && (previous.order_id || previous.payment_reference))))
+        fail("TRANSFER_CONFLICT", "已识别交易的订单号不能被修改或移除", 409);
       if (
         previous &&
         (previous.amount_atomic !== String(tx.amount_atomic) ||
@@ -1444,26 +1556,57 @@ export class Store {
         order_id: previous?.order_id || null,
         mode,
         reason: null,
+        payment_reference: paymentReference,
+        payment_reference_invalid: invalidReference ? 1 : 0,
       };
       this.run(
-        `INSERT INTO transfers VALUES(${Object.keys(row)
+        `INSERT INTO transfers (${Object.keys(row).join(",")}) VALUES(${Object.keys(row)
           .map(() => "?")
           .join(
             ",",
-          )}) ON CONFLICT(id) DO UPDATE SET confirmations=excluded.confirmations,confirmed=excluded.confirmed,removed=excluded.removed,block_hash=excluded.block_hash,block_height=excluded.block_height,block_time=excluded.block_time`,
+          )}) ON CONFLICT(id) DO UPDATE SET confirmations=excluded.confirmations,confirmed=excluded.confirmed,removed=excluded.removed,block_hash=excluded.block_hash,block_height=excluded.block_height,block_time=excluded.block_time,payment_reference=excluded.payment_reference,payment_reference_invalid=excluded.payment_reference_invalid`,
         ...Object.values(row),
       );
+      if (invalidReference) {
+        this.run("UPDATE transfers SET reason='invalid_payment_reference' WHERE id=?", id);
+        return { matched: false };
+      }
       // Bindings survive reorgs. Unclaimed ambiguities cannot resolve themselves on replay.
       let o = previous?.order_id
         ? this.get("SELECT * FROM orders WHERE order_id=?", previous.order_id)
         : null;
       if (previous?.order_id && !o) fail("TRANSFER_CONFLICT", "已绑定交易的订单不存在", 409);
-      if (!o && previous?.reason === "ambiguous_amount") return { matched: false };
+      if (!o && previous?.reason === "ambiguous_amount" && !paymentReference) return { matched: false };
+      if (paymentReference) {
+        const referenceQuote = this.get("SELECT * FROM amount_reservations WHERE payment_reference=?", paymentReference);
+        const referencedOrder = referenceQuote && this.get("SELECT * FROM orders WHERE order_id=?", referenceQuote.order_id);
+        if (!referencedOrder) {
+          this.run("UPDATE transfers SET reason='unknown_payment_reference' WHERE id=?", id);
+          return { matched: false };
+        }
+        if ((o && o.order_id !== referencedOrder.order_id) || referencedOrder.payment_mode !== "reference" ||
+            referencedOrder.merchant_id !== addr.merchant_id || referencedOrder.project_id !== addr.project_id ||
+            referencedOrder.mode !== mode || referenceQuote.chain !== tx.chain || referenceQuote.token_id !== tx.token_id ||
+            referenceQuote.pay_address !== normalized || referenceQuote.payable_atomic !== row.amount_atomic) {
+          this.run("UPDATE transfers SET reason='payment_reference_mismatch' WHERE id=?", id);
+          return { matched: false };
+        }
+        if (referencedOrder.payment_reference !== paymentReference || referencedOrder.chain !== tx.chain ||
+            referencedOrder.token_id !== tx.token_id || referencedOrder.pay_address !== normalized ||
+            referencedOrder.payable_atomic !== row.amount_atomic) {
+          this.run("UPDATE transfers SET reason='superseded_payment_method' WHERE id=?", id);
+          return { matched: false };
+        }
+        o = referencedOrder;
+      } else if (o?.payment_mode === "reference") {
+        this.run("UPDATE transfers SET reason='missing_payment_reference' WHERE id=?", id);
+        return { matched: false };
+      }
       const tolerant = this.config.payments?.allowFingerprintUnderpayment === true && isKnownStable(tx.token_id);
       if (!o && tolerant) {
         const candidates = new Map();
         const reservations = this.all(
-          "SELECT r.* FROM amount_reservations r JOIN orders o ON o.order_id=r.order_id WHERE r.chain=? AND r.token_id=? AND r.pay_address=? AND o.merchant_id=? AND o.project_id=? AND o.mode=?",
+          "SELECT r.* FROM amount_reservations r JOIN orders o ON o.order_id=r.order_id WHERE r.chain=? AND r.token_id=? AND r.pay_address=? AND o.merchant_id=? AND o.project_id=? AND o.mode=? AND o.payment_mode='amount' AND r.payment_reference IS NULL",
           tx.chain, tx.token_id, normalized, addr.merchant_id, addr.project_id, mode,
         );
         for (const quote of reservations) {
@@ -1495,12 +1638,12 @@ export class Store {
         }
       }
       if (!o) o = this.get(
-        "SELECT * FROM orders WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=? AND mode=?",
+        "SELECT * FROM orders WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=? AND mode=? AND payment_mode='amount'",
         tx.chain, tx.token_id, normalized, String(tx.amount_atomic), mode,
       );
       if (!o) {
         const reserved = this.get(
-          "SELECT order_id FROM amount_reservations WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=?",
+          "SELECT order_id FROM amount_reservations WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=? AND payment_reference IS NULL",
           tx.chain,
           tx.token_id,
           normalized,
@@ -1528,7 +1671,7 @@ export class Store {
             "UPDATE transfers SET reason='reorg_after_payment' WHERE id=?",
             id,
           );
-        if (tolerant && o.transfer_id !== id) {
+        if ((tolerant || o.payment_mode === "reference") && o.transfer_id !== id) {
           this.run("UPDATE transfers SET reason='duplicate_payment' WHERE id=?", id);
           return { matched: false };
         }
@@ -1544,7 +1687,9 @@ export class Store {
         return { matched: false };
       }
       const quote = this.orderQuote(o);
-      if (o.status === "expired") {
+      const recoverExpired = o.status === "expired" && o.payment_mode === "reference" &&
+        quote?.payment_reference === paymentReference && !!paymentReference && o.paid_source !== "manual";
+      if (o.status === "expired" && !recoverExpired) {
         this.run(
           "UPDATE transfers SET reason='expired_order_requires_review' WHERE id=?",
           id,
@@ -1579,6 +1724,7 @@ export class Store {
         );
         return { matched: false };
       }
+      if (recoverExpired) this.audit(o.merchant_id, "auto_reconcile", o.order_id);
       this.run("UPDATE transfers SET order_id=? WHERE id=?", o.order_id, id);
       if (tx.confirmed && tx.confirmations >= o.required_confirmations)
         this.settle(o, row, { source: o.paid_source === "manual" ? "manual" : "chain" });
@@ -1637,6 +1783,7 @@ export class Store {
         confirmations,
         confirmed: confirmations >= o.required_confirmations,
         removed: false,
+        payment_reference: o.payment_reference || null,
       },
       { mode: "demo" },
     ).order;
@@ -1657,6 +1804,8 @@ export class Store {
         tx.chain !== o.chain ||
         tx.token_id !== o.token_id ||
         tx.to_address !== o.pay_address ||
+        tx.payment_reference_invalid ||
+        (tx.payment_reference || null) !== (o.payment_reference || null) ||
         !this.paymentAmountMatches(o, tx.amount_atomic, quote, { force: tx.order_id === o.order_id }) ||
         tx.removed ||
         !tx.confirmed ||

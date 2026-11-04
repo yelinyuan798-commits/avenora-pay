@@ -140,13 +140,7 @@ export function initializeBilling(store, { now = () => Date.now() } = {}) {
       status = "unknown";
     try {
       usd = String(store.orderUsdAtomic(order));
-      const quote = store.get(
-        "SELECT pricing_json FROM amount_reservations WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=?",
-        order.chain,
-        order.token_id,
-        order.pay_address,
-        order.payable_atomic,
-      );
+      const quote = store.orderQuote(order);
       status = quote?.pricing_json ? "locked" : "legacy_stable_parity";
     } catch (e) {
       if (e.code !== "PRICE_SNAPSHOT_MISSING") throw e;
@@ -823,7 +817,7 @@ export function registerBilling(app, { store }) {
         fail("DEMO_ONLY", "仅本人隔离演示账单可模拟付款", 403);
       let order = store.ownedOrder(merchant, invoice.order_id);
       if (!order.chain) {
-        const method = store.availableMethods(merchant, order.project_id)[0];
+        const method = store.availableMethods(merchant, order.project_id, { payment_mode: order.payment_mode })[0];
         if (!method) fail("METHOD_REQUIRED", "请先配置演示支付方式");
         store.transaction(() =>
           store.selectMethod(order, method.chain, method.token_id),
