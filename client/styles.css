@@ -6317,3 +6317,207 @@ td b {
   white-space: normal;
   line-height: 1.7;
 }
+
+/* One-address wallet checkout and project payment mode. */
+.payment-mode-settings {
+  margin-bottom: 24px;
+}
+.payment-mode-settings .panel-heading > select {
+  width: min(250px, 40%);
+}
+.payment-mode-body {
+  padding: 0 24px 24px;
+}
+.payment-mode-options {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 13px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+}
+.payment-mode-options legend {
+  font-size: 11px;
+  color: #9093a4;
+  margin-bottom: 12px;
+}
+.payment-mode-options > label {
+  display: flex;
+  gap: 11px;
+  align-items: flex-start;
+  padding: 17px;
+  border: 1px solid #e6e5ed;
+  border-radius: 12px;
+  cursor: pointer;
+  background: #fff;
+}
+.payment-mode-options > label.selected {
+  border-color: #b5a1e3;
+  background: #faf8ff;
+}
+.payment-mode-options input {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  margin: 2px 0 0;
+  accent-color: #8a63cb;
+}
+.payment-mode-options b {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: #645377;
+}
+.payment-mode-options small {
+  display: block;
+  font-size: 11px;
+  line-height: 1.8;
+  margin-top: 7px;
+  color: #92909d;
+}
+.payment-mode-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  padding: 15px;
+  border-radius: 10px;
+  background: #f8f6fd;
+  color: #8a74a4;
+  margin-top: 17px;
+}
+.payment-mode-notice p {
+  font-size: 11px;
+  line-height: 1.9;
+}
+.payment-mode-save {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 19px;
+}
+.payment-mode-save p {
+  color: #92909d;
+  font-size: 11px;
+  line-height: 1.8;
+}
+.payment-mode-save .button {
+  flex-shrink: 0;
+}
+.checkout-page-refined .checkout-wallet-payment {
+  padding-bottom: 22px;
+}
+.checkout-page-refined .checkout-wallet-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  padding: 17px;
+  margin: 25px 0 20px;
+  border-radius: 11px;
+  background: #f2f8f4;
+  color: #4c8460;
+}
+.checkout-page-refined .checkout-wallet-notice b {
+  font-size: 12px;
+  font-weight: 600;
+  color: #356e4b;
+}
+.checkout-page-refined .checkout-wallet-notice p {
+  color: #698271;
+  font-size: 12px;
+  line-height: 1.85;
+  margin-top: 7px;
+}
+.checkout-page-refined .checkout-wallet-button {
+  min-height: 48px;
+  white-space: normal;
+  line-height: 1.7;
+  padding: 12px 14px;
+  font-size: 13px;
+}
+.checkout-page-refined .checkout-wallet-button > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.checkout-page-refined .checkout-wallet-help {
+  font-size: 11px;
+  color: #7d8c82;
+  line-height: 1.9;
+  margin: 14px 0;
+}
+.checkout-page-refined .checkout-wallet-deadline {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  color: #91a095;
+  font-size: 11px;
+  line-height: 1.8;
+  margin-top: 17px;
+}
+.checkout-page-refined .checkout-wallet-deadline svg {
+  margin-top: 3px;
+}
+.checkout-page-refined .checkout-wallet-submitted {
+  padding: 24px 0 6px;
+  text-align: center;
+  color: #518766;
+}
+.checkout-page-refined .checkout-wallet-submitted h2 {
+  font-size: 17px;
+  color: #345e43;
+  margin-top: 12px;
+  font-weight: 600;
+}
+.checkout-page-refined .checkout-wallet-submitted > p {
+  font-size: 12px;
+  line-height: 1.9;
+  color: #7a9081;
+  margin-top: 10px;
+}
+.checkout-page-refined .checkout-details dd code {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  font-size: 11px;
+}
+@media (max-width: 700px) {
+  .payment-mode-settings .panel-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .payment-mode-settings .panel-heading > select {
+    width: 100%;
+  }
+  .payment-mode-body {
+    padding: 0 16px 20px;
+  }
+  .payment-mode-options {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+  .payment-mode-options > label {
+    padding: 14px;
+  }
+  .payment-mode-save {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+  }
+}
+.create-order-payment-note {
+  font-size: 11px;
+  line-height: 1.85;
+  color: #917aa8;
+  padding: 13px 14px;
+  margin: -3px 0 19px;
+  background: #f8f5fc;
+  border: 1px solid #ebe3f2;
+  border-radius: 9px;
+}
+.create-order-payment-note > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 17px;
+  margin-top: 8px;
+}

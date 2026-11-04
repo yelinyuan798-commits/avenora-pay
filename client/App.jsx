@@ -61,6 +61,7 @@ import QRCode from "qrcode";
 import { downloadCsv } from "./csv.js";
 import { displayAmount, tokenSymbol, pricingSourceLabel } from "./money.js";
 import { api, mutate, setProjectScope } from "./api.js";
+import { sendWalletPayment, isTransactionHash } from "./wallet-payment.mjs";
 
 const Context = createContext(null);
 const useApp = () => useContext(Context);
@@ -917,9 +918,9 @@ function Landing() {
             {[
               [
                 CreditCard,
-                "生成付款指纹",
-                "为订单分配精确金额，区分同地址收到的多笔转账。",
-                "9.90 USD → 9.9037 USDT",
+                "生成付款订单",
+                "钱包付款带订单标识，支持同地址、同金额订单；普通转账保留金额识别。",
+                "一个收款地址 · 自动区分订单",
               ],
               [
                 Wallet,
@@ -1074,7 +1075,7 @@ function Landing() {
               ],
               [
                 "需要提供钱包私钥吗？",
-                "不需要。网关读取区块链公开交易，根据网络、币种、收款地址及精确金额识别付款。",
+                "不需要。网关读取区块链公开交易，按钱包付款携带的订单标识或普通转账的金额规则识别付款。",
               ],
               [
                 "实际收款需要配置什么？",
@@ -1881,12 +1882,14 @@ function CreateOrder({ onClose, onDone, product }) {
     data,
     loading,
     error: loadError,
+    reload: reloadOptions,
   } = useLoad(async () => {
-    const [p, s] = await Promise.all([
+    const [p, s, policy] = await Promise.all([
       api("/api/projects"),
       api("/api/products"),
+      api("/api/payment-policies"),
     ]);
-    return { ...p, ...s };
+    return { ...p, ...s, ...policy };
   });
   const [project, setProject] = useState(
       product?.project_id || activeProjectId || "",
@@ -1901,14 +1904,56 @@ function CreateOrder({ onClose, onDone, product }) {
   useEffect(() => {
     if (!project && data?.projects?.length) setProject(data.projects[0].id);
   }, [data]);
-  const chains = registry.chains || [];
+  const paymentPolicy = (data?.policies || []).find(
+    (policy) => policy.project_id === project,
+  );
+  const referenceMode = paymentPolicy?.payment_mode === "reference";
+  const chains = useMemo(() => {
+    const networks = registry.chains || [];
+    if (!referenceMode) return networks;
+    const available = paymentPolicy.available_methods || [];
+    return networks
+      .map((network) => ({
+        ...network,
+        tokens: (network.tokens || []).filter((asset) =>
+          available.some(
+            (method) =>
+              method.chain === network.id && method.token_id === asset.id,
+          ),
+        ),
+      }))
+      .filter((network) => network.tokens.length);
+  }, [registry.chains, referenceMode, paymentPolicy]);
+  const noReferenceMethods = referenceMode && !chains.length;
   const activeChain = chains.find((c) => c.id === chain);
+  useEffect(() => {
+    if (!chain) return;
+    const network = chains.find((item) => item.id === chain);
+    if (!network) {
+      setChain(chains[0]?.id || "");
+      setToken(chains[0]?.tokens?.[0]?.id || "");
+    } else if (!network.tokens.some((asset) => asset.id === token)) {
+      setToken(network.tokens[0]?.id || "");
+    }
+  }, [chains, chain, token]);
   const products = (data?.products || []).filter(
     (p) => p.project_id === project,
   );
   async function submit(e) {
     e.preventDefault();
     setError("");
+    if (noReferenceMethods) {
+      setError("该项目暂无可用的钱包付款方式，请先配置收款网络、代币和地址。");
+      return;
+    }
+    if (
+      referenceMode &&
+      chain &&
+      !activeChain?.tokens.some((asset) => asset.id === token)
+    ) {
+      setError("当前方式不可用，请重新选择付款网络与币种。");
+      return;
+    }
     setBusy(true);
     const f = new FormData(e.currentTarget);
     try {
@@ -2009,6 +2054,7 @@ function CreateOrder({ onClose, onDone, product }) {
             <Field label="支付网络">
               <select
                 value={chain}
+                disabled={noReferenceMethods}
                 onChange={(e) => {
                   setChain(e.target.value);
                   setToken(
@@ -2039,6 +2085,29 @@ function CreateOrder({ onClose, onDone, product }) {
               </select>
             </Field>
           </div>
+          {referenceMode && (
+            <div className="create-order-payment-note">
+              <p>
+                {noReferenceMethods
+                  ? "该项目暂无可用的钱包付款方式。请先配置相应节点、代币和收款地址，再刷新列表。"
+                  : "本项目通过收银台钱包按钮付款，仅显示已启用的可用方式；直接从交易所提币不适用。"}
+              </p>
+              {noReferenceMethods && (
+                <div>
+                  <Link to="/merchant/addresses" className="table-link">
+                    前往收款配置
+                  </Link>
+                  <button
+                    type="button"
+                    className="table-link"
+                    onClick={reloadOptions}
+                  >
+                    刷新可用方式
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
           {token === "bitcoin-btc" && chain === "bitcoin" && (
             <p className="field-hint">
               BTC 使用 Bitcoin 主网，订单至少 546 satoshi（0.00000546
@@ -2056,7 +2125,24 @@ function CreateOrder({ onClose, onDone, product }) {
               placeholder="例如 SHOP-20261102-001"
             />
           </Field>
-          <FormFooter busy={busy} onClose={onClose} text="创建订单" />
+          <div className="form-footer">
+            <button
+              type="button"
+              className="button secondary"
+              onClick={onClose}
+            >
+              取消
+            </button>
+            <button
+              className="button primary"
+              disabled={
+                busy || Boolean(loadError) || !project || noReferenceMethods
+              }
+            >
+              {busy && <LoaderCircle size={16} className="spin" />}
+              {busy ? "处理中…" : "创建订单"}
+            </button>
+          </div>
         </form>
       )}
     </Modal>
@@ -2541,14 +2627,148 @@ function Projects() {
   );
 }
 
+function PaymentModeSettings({ data, loading, error, reload }) {
+  const { activeProjectId, notify } = useApp();
+  const [project, setProject] = useState(activeProjectId || ""),
+    [paymentMode, setPaymentMode] = useState("amount"),
+    [busy, setBusy] = useState(false),
+    [saveError, setSaveError] = useState("");
+  const projects = data?.projects || [];
+  const savedMode =
+    (data?.policies || []).find((policy) => policy.project_id === project)
+      ?.payment_mode || "amount";
+  useEffect(() => {
+    setProject(activeProjectId || "");
+  }, [activeProjectId]);
+  useEffect(() => {
+    if (!project && projects.length) setProject(projects[0].id);
+  }, [project, data?.projects]);
+  useEffect(() => {
+    setPaymentMode(savedMode);
+    setSaveError("");
+  }, [project, savedMode]);
+  async function save() {
+    setBusy(true);
+    setSaveError("");
+    try {
+      await mutate(
+        `/api/projects/${encodeURIComponent(project)}/payment-policy`,
+        { payment_mode: paymentMode },
+        "PUT",
+      );
+      notify(
+        paymentMode === "reference"
+          ? "已启用钱包支付自动认单"
+          : "已启用普通转账认单",
+      );
+      reload();
+    } catch (e) {
+      setSaveError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <section className="panel payment-mode-settings">
+      <div className="panel-heading">
+        <div>
+          <h2>钱包支付自动认单</h2>
+          <p>一个收款地址，也能区分金额相同的订单。</p>
+        </div>
+        <ProjectSelect
+          projects={projects}
+          value={project}
+          onChange={setProject}
+          disabled={busy || loading}
+        />
+      </div>
+      {loading ? (
+        <Spinner />
+      ) : error ? (
+        <ResourceError error={error} onRetry={reload} />
+      ) : !project ? (
+        <Empty
+          icon={FolderKanban}
+          title="先创建一个项目"
+          description="创建项目并添加收款地址后，可配置付款方式。"
+        />
+      ) : (
+        <div className="payment-mode-body">
+          <InlineError error={saveError} />
+          <fieldset className="payment-mode-options" disabled={busy}>
+            <legend>新订单的付款方式</legend>
+            <label className={paymentMode === "reference" ? "selected" : ""}>
+              <input
+                type="radio"
+                name="payment-mode"
+                checked={paymentMode === "reference"}
+                onChange={() => setPaymentMode("reference")}
+              />
+              <span>
+                <b>收银台钱包付款</b>
+                <small>
+                  买家点击钱包按钮支付，系统自动识别对应订单，无需小数尾数。目前支持
+                  BSC / USDT。
+                </small>
+              </span>
+            </label>
+            <label className={paymentMode === "amount" ? "selected" : ""}>
+              <input
+                type="radio"
+                name="payment-mode"
+                checked={paymentMode === "amount"}
+                onChange={() => setPaymentMode("amount")}
+              />
+              <span>
+                <b>普通转账认单</b>
+                <small>
+                  使用收款地址和金额匹配，保留现有钱包转账及交易所链上提现流程。
+                </small>
+              </span>
+            </label>
+          </fieldset>
+          {paymentMode === "reference" && (
+            <div className="payment-mode-notice">
+              <Wallet size={19} />
+              <p>
+                买家必须通过收银台的钱包按钮付款。直接从交易所提币、手动向地址普通转账不适用于此自动认单模式。无需新建地址，也不需要上传钱包私钥或助记词。
+              </p>
+            </div>
+          )}
+          <div className="payment-mode-save">
+            <p>
+              当前已保存：
+              {savedMode === "reference" ? "收银台钱包付款" : "普通转账认单"}
+              。修改只影响新订单。
+            </p>
+            <button
+              className="button primary"
+              onClick={save}
+              disabled={busy || paymentMode === savedMode}
+            >
+              {busy ? (
+                <LoaderCircle size={15} className="spin" />
+              ) : (
+                <Check size={15} />
+              )}
+              保存付款方式
+            </button>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function Addresses() {
   const { registry, mode, notify } = useApp();
   const { data, loading, error, reload } = useLoad(async () => {
-    const [a, p] = await Promise.all([
+    const [a, p, policy] = await Promise.all([
       api("/api/addresses"),
       api("/api/projects"),
+      api("/api/payment-policies"),
     ]);
-    return { ...a, ...p };
+    return { ...a, ...p, ...policy };
   });
   const [adding, setAdding] = useState(false),
     [project, setProject] = useState(""),
@@ -2616,6 +2836,12 @@ function Addresses() {
         <ShieldCheck size={19} />
         <p>仅添加公开收款地址。平台不需要钱包私钥或助记词。</p>
       </div>
+      <PaymentModeSettings
+        data={data}
+        loading={loading}
+        error={error}
+        reload={reload}
+      />
       <section className="panel">
         {loading ? (
           <Spinner />
@@ -4007,6 +4233,260 @@ function AccountSettings() {
   );
 }
 
+function walletSubmissionKey(orderId) {
+  return `avenora.wallet-submission.${orderId}`;
+}
+function readWalletSubmission(orderId) {
+  try {
+    const value = JSON.parse(
+      sessionStorage.getItem(walletSubmissionKey(orderId)) || "null",
+    );
+    if (value?.status === "submitted" && isTransactionHash(value.tx_hash))
+      return value;
+    if (["unknown", "wallet_pending"].includes(value?.status))
+      return { status: "unknown" };
+  } catch {}
+  return null;
+}
+function writeWalletSubmission(orderId, value) {
+  try {
+    if (value)
+      sessionStorage.setItem(
+        walletSubmissionKey(orderId),
+        JSON.stringify(value),
+      );
+    else sessionStorage.removeItem(walletSubmissionKey(orderId));
+  } catch {}
+}
+function WalletReferencePayment({ order, token, isDemo, onRefresh }) {
+  const { registry } = useApp();
+  const network = registry.chains?.find((item) => item.id === order.chain);
+  const networkFeeToken =
+    order.chain === "bsc"
+      ? "BNB"
+      : ["ethereum", "base", "arbitrum"].includes(order.chain)
+        ? "ETH"
+        : "该网络的原生币";
+  const [busy, setBusy] = useState(false),
+    [stage, setStage] = useState(""),
+    [error, setError] = useState(""),
+    [submission, setSubmission] = useState(() =>
+      isDemo ? null : readWalletSubmission(order.order_id),
+    );
+  const inFlight = useRef(false);
+  const hasProvider = typeof window.ethereum?.request === "function";
+  const stageLabels = {
+    connecting: "请在钱包中确认连接…",
+    switching: "请在钱包中确认切换网络…",
+    confirming: "请在钱包中确认付款…",
+    demo: "正在模拟付款…",
+  };
+  async function pay() {
+    if (inFlight.current || submission) return;
+    const remembered = !isDemo && readWalletSubmission(order.order_id);
+    if (remembered) {
+      setSubmission(remembered);
+      return;
+    }
+    inFlight.current = true;
+    setBusy(true);
+    setError("");
+    let sendRequested = false;
+    let submitted = false;
+    try {
+      if (isDemo) {
+        setStage("demo");
+        await mutate(`/checkout/${encodeURIComponent(token)}/demo-pay`);
+        await onRefresh();
+        return;
+      }
+      const result = await api(`/checkout/${encodeURIComponent(token)}/state`);
+      const latest = result.order || result;
+      if (
+        latest.order_id !== order.order_id ||
+        latest.mode === "demo" ||
+        latest.payment_mode !== "reference" ||
+        latest.status !== "pending" ||
+        latest.payable !== true ||
+        !latest.wallet_payment
+      )
+        throw new Error("当前订单已不能发起钱包付款，请刷新查看最新状态。");
+      const displayed = order.wallet_payment;
+      const fresh = latest.wallet_payment;
+      if (
+        !displayed ||
+        latest.chain !== order.chain ||
+        latest.token_id !== order.token_id ||
+        latest.payment_reference !== order.payment_reference ||
+        [
+          "chain_id",
+          "to",
+          "value",
+          "data",
+          "recipient",
+          "token_symbol",
+          "token_decimals",
+          "amount",
+          "amount_atomic",
+          "reference",
+          "expires_at",
+        ].some((field) => fresh[field] !== displayed[field])
+      )
+        throw new Error("订单付款方式已变化，请刷新页面后重新核对付款信息。");
+      if (network?.family !== "evm" || !Number.isSafeInteger(network.chainId))
+        throw new Error("当前网络信息尚未就绪，请刷新页面后重试。");
+      const clockOffset = latest.server_time
+        ? Date.parse(latest.server_time) - Date.now()
+        : 0;
+      const sent = await sendWalletPayment(
+        window.ethereum,
+        latest.wallet_payment,
+        {
+          now: () => Date.now() + clockOffset,
+          expected: {
+            amount: order.payable_amount,
+            recipient: order.pay_address,
+            chainId: "0x" + BigInt(network.chainId).toString(16),
+            symbol: tokenSymbol(order),
+            decimals: order.token_decimals,
+          },
+          onStage: (value) => {
+            setStage(value);
+            if (value === "confirming") {
+              sendRequested = true;
+              writeWalletSubmission(order.order_id, {
+                status: "wallet_pending",
+              });
+            }
+          },
+        },
+      );
+      submitted = true;
+      writeWalletSubmission(order.order_id, sent);
+      setSubmission(sent);
+      await onRefresh();
+    } catch (e) {
+      if (e.mayHaveSubmitted) {
+        const unknown = { status: "unknown" };
+        writeWalletSubmission(order.order_id, unknown);
+        setSubmission(unknown);
+      } else if (sendRequested && !submitted) {
+        writeWalletSubmission(order.order_id, null);
+      }
+      setError(e.message || "暂时无法发起付款，请稍后重试。");
+    } finally {
+      inFlight.current = false;
+      setBusy(false);
+      setStage("");
+    }
+  }
+  return (
+    <div className="checkout-wallet-payment">
+      <div className="checkout-amount-box">
+        <small>订单应付金额</small>
+        <h1 className="checkout-payable">
+          <span className="exact-token-amount">
+            {displayAmount(order.payable_amount)}
+          </span>
+          <span className="checkout-payable-unit">
+            <em>{tokenSymbol(order)}</em>
+          </span>
+        </h1>
+      </div>
+      {submission ? (
+        <div className="checkout-wallet-submitted" role="status">
+          <Radio size={22} />
+          <h2>
+            {submission.status === "submitted"
+              ? "已提交，等待链上确认"
+              : "请核对钱包中的付款状态"}
+          </h2>
+          <p>
+            {submission.status === "submitted"
+              ? "交易已提交，支付结果以链上确认后本页的自动更新为准。请勿重复付款。"
+              : "本次钱包请求的结果暂不明确，请先查看钱包交易记录。为避免重复付款，本页不会再次发起支付。"}
+          </p>
+          {submission.tx_hash && (
+            <div className="checkout-tx">
+              <small>交易哈希</small>
+              <code>{clip(submission.tx_hash, 12)}</code>
+              <CopyButton
+                value={submission.tx_hash}
+                label="复制已提交交易哈希"
+              />
+            </div>
+          )}
+        </div>
+      ) : (
+        <>
+          <div className="checkout-wallet-notice">
+            <Wallet size={19} />
+            <div>
+              <b>通过本页钱包按钮付款</b>
+              <p>
+                此订单使用钱包付款自动识别。请勿从交易所直接提币，也不要手动向收款地址普通转账。
+              </p>
+            </div>
+          </div>
+          <InlineError error={error} />
+          {!isDemo && !hasProvider && (
+            <p className="checkout-wallet-help">
+              未检测到浏览器钱包。请使用 MetaMask、OKX
+              等支持浏览器钱包的环境打开本页，再连接钱包付款。
+            </p>
+          )}
+          <button
+            className="button primary full checkout-wallet-button"
+            onClick={pay}
+            disabled={busy || (!isDemo && !order.wallet_payment)}
+          >
+            {busy ? (
+              <LoaderCircle size={17} className="spin" />
+            ) : isDemo ? (
+              <Zap size={17} />
+            ) : (
+              <Wallet size={17} />
+            )}
+            <span>
+              {busy
+                ? stageLabels[stage] || "正在检查订单…"
+                : isDemo
+                  ? "模拟钱包支付（不转账）"
+                  : `连接钱包并支付 ${displayAmount(order.payable_amount)} ${tokenSymbol(order)}`}
+            </span>
+          </button>
+          {!isDemo && !order.wallet_payment && (
+            <p className="checkout-wallet-help">
+              当前暂未取得可用的钱包付款信息，请稍后刷新。
+            </p>
+          )}
+          <p className="checkout-wallet-help">
+            {isDemo
+              ? "仅模拟此演示订单的付款过程，不会连接钱包或发起真实转账。"
+              : `请在钱包核对付款金额，实际到账须等于上方应付金额（包含商户费用）。网络手续费使用 ${networkFeeToken} 另付，请在付款截止前完成钱包确认。`}
+          </p>
+        </>
+      )}
+      <div className="checkout-wallet-deadline">
+        <Clock3 size={13} />
+        <span>
+          付款截止：
+          {order.expires_at
+            ? new Date(order.expires_at).toLocaleString("zh-CN", {
+                month: "2-digit",
+                day: "2-digit",
+                hour: "2-digit",
+                minute: "2-digit",
+                second: "2-digit",
+                hour12: false,
+              })
+            : "—"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 function Checkout({ token }) {
   const { user, mode, notify, public_demo: publicDemo } = useApp();
   const invoiceId = new URLSearchParams(location.search).get("invoice");
@@ -4081,6 +4561,8 @@ function Checkout({ token }) {
     .toString()
     .padStart(2, "0")}:${(remaining % 60).toString().padStart(2, "0")}`;
   const isBscUsdt = data?.chain === "bsc" && tokenSymbol(data) === "USDT";
+  const referencePayment = data?.payment_mode === "reference";
+  const waitingStock = data?.fulfillment_status === "waiting_stock";
   // The server supplies the exact lower bound; never derive it by rounding the quote.
   const tolerance = data?.payment_tolerance;
   const paymentTolerance =
@@ -4200,7 +4682,9 @@ function Checkout({ token }) {
                   {paymentWindowClosed
                     ? "已到付款截止"
                     : data.status === "review"
-                      ? "付款待核对"
+                      ? waitingStock
+                        ? "等待补货"
+                        : "付款待核对"
                       : undefined}
                 </Badge>
               </div>
@@ -4375,9 +4859,13 @@ function Checkout({ token }) {
                   <span>
                     <Clock3 size={30} />
                   </span>
-                  <h2>付款待核对</h2>
+                  <h2>
+                    {waitingStock ? "款项已确认，等待补货" : "付款待核对"}
+                  </h2>
                   <p>
-                    已收到付款记录，请勿重复转账。商户正在核对处理，本页会自动更新结果。
+                    {waitingStock
+                      ? "付款已确认，请勿重复转账。商品补货后会自动发货，本页将自动更新交付结果。"
+                      : "已收到付款记录，请勿重复转账。商户正在核对处理，本页会自动更新结果。"}
                   </p>
                   {data.tx_hash && (
                     <div className="checkout-tx">
@@ -4408,6 +4896,14 @@ function Checkout({ token }) {
                         : "请返回商户页面重新创建订单，不要继续向此订单转账。"}
                   </p>
                 </div>
+              ) : referencePayment ? (
+                <WalletReferencePayment
+                  key={data.order_id}
+                  order={data}
+                  token={token}
+                  isDemo={isDemo}
+                  onRefresh={load}
+                />
               ) : (
                 <>
                   <div className="checkout-amount-box">
@@ -4671,12 +5167,20 @@ function Checkout({ token }) {
                         </dd>
                       </div>
                     )}
-                    {paymentTolerance && (
+                    {!referencePayment && paymentTolerance && (
                       <div>
                         <dt>最低到账金额</dt>
                         <dd>
                           {displayAmount(paymentTolerance.minimum_amount)}{" "}
                           {tokenSymbol(data)}
+                        </dd>
+                      </div>
+                    )}
+                    {referencePayment && data.pay_address && (
+                      <div>
+                        <dt>收款地址</dt>
+                        <dd>
+                          <code>{data.pay_address}</code>
                         </dd>
                       </div>
                     )}
@@ -4686,6 +5190,7 @@ function Checkout({ token }) {
               </details>
             </section>
             {isDemo &&
+              !referencePayment &&
               user &&
               !paymentWindowClosed &&
               ["pending", "confirming"].includes(data.status) && (
@@ -4918,7 +5423,7 @@ function Docs() {
               <h2>收银台</h2>
               <p>
                 把客户引导到建单返回的
-                checkout_url。付款页展示网络、精确金额、地址、二维码和剩余时间，并每
+                checkout_url。钱包付款模式通过收银台按钮连接钱包并支付，支持同地址、同金额订单；普通转账模式展示收款地址、二维码和完整金额。页面显示付款截止时间，并每
                 5 秒查询状态。
               </p>
               <pre>{`GET  /checkout/{token}/state\nGET  /checkout/{token}/methods\nPOST /checkout/{token}/select`}</pre>
