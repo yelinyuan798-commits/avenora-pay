@@ -11,7 +11,7 @@ import {
 } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { PriceBook, PricingError, isKnownStable, assetForToken, ceilDivide, USD_SCALE } from "./pricing.mjs";
+import { PriceBook, PricingError, isKnownStable, assetForToken, ceilDivide, USD_SCALE, BNB_PAYMENT_QUANTUM } from "./pricing.mjs";
 import { referenceMethod, encodeReferenceTransfer, isPaymentReference } from "./payment-reference.mjs";
 
 export class AppError extends Error {
@@ -220,6 +220,8 @@ export class Store {
       this.db.exec("ALTER TABLE orders ADD COLUMN payment_mode TEXT NOT NULL DEFAULT 'amount'");
     if (!columns.has("payment_reference"))
       this.db.exec("ALTER TABLE orders ADD COLUMN payment_reference TEXT");
+    if (!columns.has("allocation_strategy"))
+      this.db.exec("ALTER TABLE orders ADD COLUMN allocation_strategy TEXT NOT NULL DEFAULT 'legacy'");
     this.db.exec(
       "UPDATE orders SET selection_deadline=expires_at,status=CASE WHEN status='pending' THEN 'awaiting_payment' ELSE status END WHERE chain IS NULL AND selection_deadline IS NULL",
     );
@@ -237,6 +239,10 @@ export class Store {
       );
     if (!quoteColumns.has("payment_reference"))
       this.db.exec("ALTER TABLE amount_reservations ADD COLUMN payment_reference TEXT");
+    if (!quoteColumns.has("allocation_strategy"))
+      this.db.exec("ALTER TABLE amount_reservations ADD COLUMN allocation_strategy TEXT NOT NULL DEFAULT 'legacy'");
+    if (!quoteColumns.has("expires_at"))
+      this.db.exec("ALTER TABLE amount_reservations ADD COLUMN expires_at TEXT");
     if (!this.all("PRAGMA table_info(transfers)").some(c => c.name === "payment_reference"))
       this.db.exec("ALTER TABLE transfers ADD COLUMN payment_reference TEXT");
     if (!this.all("PRAGMA table_info(transfers)").some(c => c.name === "payment_reference_invalid"))
@@ -245,6 +251,7 @@ export class Store {
     this.db.exec(
       "INSERT OR IGNORE INTO amount_reservations(chain,token_id,pay_address,payable_atomic,order_id,created_at) SELECT chain,token_id,pay_address,payable_atomic,order_id,COALESCE(payment_started_at,created_at) FROM orders WHERE chain IS NOT NULL AND payment_mode='amount'",
     );
+    this.db.exec("UPDATE amount_reservations SET expires_at=(SELECT expires_at FROM orders WHERE orders.order_id=amount_reservations.order_id) WHERE expires_at IS NULL");
     this.priceBook =
       priceBook ||
       new PriceBook({ db: this.db, config: () => this.config.pricing || {} });
@@ -270,9 +277,12 @@ export class Store {
         if (oldOrderConstraint.test(orderSql)) rebuild("orders", orderSql.replace(oldOrderConstraint, ""));
         if (oldQuoteConstraint.test(quoteSql)) rebuild("amount_reservations", quoteSql.replace(oldQuoteConstraint,
           "PRIMARY KEY(order_id,chain,token_id,pay_address,payable_atomic)"));
-        this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS orders_amount_identity ON orders(chain,token_id,pay_address,payable_atomic) WHERE payment_mode='amount';
+        this.db.exec(`DROP INDEX IF EXISTS orders_amount_identity;
+          DROP INDEX IF EXISTS reservations_amount_identity;
+          CREATE UNIQUE INDEX orders_amount_identity ON orders(chain,token_id,pay_address,payable_atomic) WHERE payment_mode='amount' AND allocation_strategy='legacy';
           CREATE UNIQUE INDEX IF NOT EXISTS orders_payment_reference ON orders(payment_reference) WHERE payment_reference IS NOT NULL;
-          CREATE UNIQUE INDEX IF NOT EXISTS reservations_amount_identity ON amount_reservations(chain,token_id,pay_address,payable_atomic) WHERE payment_reference IS NULL;
+          CREATE UNIQUE INDEX reservations_amount_identity ON amount_reservations(chain,token_id,pay_address,payable_atomic) WHERE payment_reference IS NULL AND allocation_strategy='legacy';
+          CREATE INDEX IF NOT EXISTS reservations_amount_windows ON amount_reservations(chain,token_id,pay_address,payable_atomic,created_at,expires_at);
           CREATE UNIQUE INDEX IF NOT EXISTS reservations_payment_reference ON amount_reservations(payment_reference) WHERE payment_reference IS NOT NULL;`);
         if (this.all("PRAGMA foreign_key_check").length) throw Error("Payment reference migration failed foreign-key integrity check");
       });
@@ -754,8 +764,88 @@ export class Store {
       order.chain, order.token_id, order.pay_address, order.payable_atomic, order.order_id, order.payment_reference || null,
     );
   }
+  conflictAllocation(tokenId, decimals) {
+    const settings = this.config.payments || {};
+    if (settings.amountAllocation !== "conflict_only") return null;
+    const tokens = settings.conflictTokens ?? ["bsc-usdt"];
+    if (!Array.isArray(tokens) || tokens.some(t => typeof t !== "string"))
+      fail("INVALID_PAYMENT_CONFIG", "冲突金额币种配置无效", 503);
+    if (!tokens.includes(tokenId)) return null;
+    if (!isKnownStable(tokenId) && tokenId !== "bsc-bnb")
+      fail("INVALID_PAYMENT_CONFIG", "固定U尾差仅适用于稳定币", 503);
+    if (settings.conflictSteps !== undefined && (!settings.conflictSteps || typeof settings.conflictSteps !== "object" || Array.isArray(settings.conflictSteps)))
+      fail("INVALID_PAYMENT_CONFIG", "币种金额步长配置无效", 503);
+    const value = settings.conflictSteps?.[tokenId] ?? settings.conflictStep ?? "0.0000001";
+    if (typeof value !== "string" || !/^0\.0*[1-9]\d*$/.test(value) ||
+        value.split(".")[1].length > decimals)
+      fail("INVALID_PAYMENT_CONFIG", "金额步长必须是代币精度支持的小于1的正数", 503);
+    const step = decimalAtomic(value, decimals);
+    if (tokenId === "bsc-bnb" && (decimals !== 18 || step % BNB_PAYMENT_QUANTUM !== 0n))
+      fail("INVALID_PAYMENT_CONFIG", "BNB冲突步长必须符合当前付款小数精度", 503);
+    return { step, strategy: "conflict_only" };
+  }
+  conflictAmountReservations(chain, tokenId, address, timestamp) {
+    const quotes = this.all(
+      "SELECT r.* FROM amount_reservations r WHERE r.chain=? AND r.token_id=? AND r.pay_address=? AND r.payment_reference IS NULL",
+      chain, tokenId, address,
+    );
+    const startSecond = Math.floor(timestamp / 1000) * 1000, ranges = [];
+    for (const quote of quotes) {
+      const owner = this.get("SELECT * FROM orders WHERE order_id=?", quote.order_id);
+      if (!owner) fail("PRICE_SNAPSHOT_MISSING", "历史报价归属无效，暂不能分配金额", 409);
+      const exact = BigInt(quote.payable_atomic);
+      if (quote.allocation_strategy !== "conflict_only") {
+        // 旧报价永久占用；若旧容差仍开启，其整个可匹配区间也必须避开。
+        const bounds = this.fingerprintBounds(owner, quote);
+        ranges.push(bounds ? [bounds.minimum, bounds.maximum] : [exact, exact]);
+        const rounded = this.legacyBnbRoundedAmount(owner, quote, { force: true });
+        if (rounded !== null) ranges.push([rounded, rounded]);
+        continue;
+      }
+      const expiry = Date.parse(quote.expires_at);
+      if (!Number.isFinite(expiry) || startSecond <= expiry ||
+          ["confirming", "review"].includes(owner.status) ||
+          (owner.transfer_id && !["paid", "canceled"].includes(owner.status))) ranges.push([exact, exact]);
+    }
+    return ranges;
+  }
+  conflictQuoteCandidates(tx, address, mode) {
+    const timestamp = Date.parse(tx.block_time);
+    return this.all(
+      "SELECT r.* FROM amount_reservations r JOIN orders o ON o.order_id=r.order_id WHERE r.chain=? AND r.token_id=? AND r.pay_address=? AND r.payable_atomic=? AND r.allocation_strategy='conflict_only' AND r.payment_reference IS NULL AND o.mode=? AND o.merchant_id=? AND o.project_id=?",
+      tx.chain, tx.token_id, address.address, String(tx.amount_atomic), mode, address.merchant_id, address.project_id,
+    ).filter(quote => timestamp >= Math.floor(Date.parse(quote.created_at) / 1000) * 1000 &&
+      timestamp <= Date.parse(quote.expires_at));
+  }
+  restoreConflictQuote(order, quote, network, emitEvent) {
+    let snapshot;
+    try { snapshot = JSON.parse(quote.pricing_json); } catch {}
+    const { token } = this.tokenSpec(quote.chain, quote.token_id);
+    if (snapshot?.allocation_strategy !== "conflict_only" || snapshot.token_decimals !== token.decimals ||
+        !/^[1-9]\d*$/.test(quote.payable_atomic) || !/^[1-9]\d*$/.test(snapshot.base_payable_atomic || "") ||
+        !/^[1-9]\d*$/.test(snapshot.conflict_step_atomic || "") ||
+        BigInt(snapshot.base_payable_atomic) > BigInt(quote.payable_atomic) ||
+        !/^\d+$/.test(snapshot.usd_atomic || "") || !Number.isFinite(Date.parse(quote.expires_at)))
+      fail("PRICE_SNAPSHOT_MISSING", "原支付方式缺少可信锁价，无法自动恢复", 409);
+    const amount = compactTokenAmount(quote.payable_atomic, token.decimals);
+    this.callHook("enforceQuoteLimit", this.merchant(order.merchant_id), order, {
+      usd_atomic: snapshot.usd_atomic, payable_amount: amount, decimals: token.decimals,
+    });
+    const expiresAt = new Date(Math.min(Date.parse(order.expires_at), Date.parse(quote.expires_at))).toISOString();
+    if (Date.parse(expiresAt) <= Date.now()) fail("ORDER_NOT_PAYABLE", "原报价已过期", 409);
+    const required = Math.max(Number(network.confirmations || 1),
+      Number(this.chainConfig(quote.chain)?.confirmations || 0), Number(snapshot.required_confirmations || 0));
+    this.run(
+      "UPDATE orders SET status='pending',chain=?,token_id=?,pay_address=?,payable_atomic=?,payable_amount=?,payment_reference=NULL,allocation_strategy='conflict_only',required_confirmations=?,expires_at=? WHERE order_id=?",
+      quote.chain, quote.token_id, quote.pay_address, quote.payable_atomic, amount, required, expiresAt, order.order_id,
+    );
+    const updated = this.get("SELECT * FROM orders WHERE order_id=?", order.order_id);
+    if (emitEvent) this.enqueue(updated, "order.method_selected");
+    return this.orderView(updated);
+  }
   fingerprintBounds(order, quote = this.orderQuote(order), { force = false } = {}) {
-    if (order?.payment_mode === "reference" || quote?.payment_reference) return null;
+    if (order?.payment_mode === "reference" || quote?.payment_reference ||
+        quote?.allocation_strategy === "conflict_only" || (!quote && order?.allocation_strategy === "conflict_only")) return null;
     if ((!force && this.config.payments?.allowFingerprintUnderpayment !== true) ||
         !isKnownStable(quote?.token_id || order?.token_id)) return null;
     // Only immutable server-created quote data can establish the principal + fee floor.
@@ -795,8 +885,87 @@ export class Store {
     const maximum = quote?.payable_atomic || order.payable_atomic;
     if (String(amount) === maximum) return true;
     if (!/^\d+$/.test(String(amount))) return false;
+    const rounded = this.legacyBnbRoundedAmount(order, quote, { force });
+    if (rounded !== null && String(amount) === rounded.toString()) return true;
     const bounds = this.fingerprintBounds(order, quote, { force });
     return !!bounds && BigInt(amount) >= bounds.minimum && BigInt(amount) <= bounds.maximum;
+  }
+  legacyBnbRoundedAmount(order, quote = this.orderQuote(order), { force = false } = {}) {
+    return this.bnbQuoteAmount(order, quote, { force, onlyLegacy: true });
+  }
+  bnbQuoteAmount(order, quote = this.orderQuote(order), { force = false, onlyLegacy = false } = {}) {
+    // 只兼容升级前 BNB 报价向上取到八位小数；原始报价和实收金额始终保留。
+    if (order?.payment_mode !== "amount" || quote?.payment_reference ||
+        quote?.chain !== "bsc" || quote?.token_id !== "bsc-bnb" ||
+        !["legacy", "conflict_only"].includes(quote?.allocation_strategy) || quote?.order_id !== order.order_id) return null;
+    try {
+      const s = JSON.parse(quote.pricing_json), { token } = this.tokenSpec(quote.chain, quote.token_id);
+      const newQuantum = [6, 8].includes(s.payment_decimals) ? 10n ** BigInt(18 - s.payment_decimals) : null;
+      const newQuote = newQuantum !== null && s.rounding_quantum_atomic === newQuantum.toString();
+      if ((newQuote && onlyLegacy) || (!newQuote &&
+          ((!force && this.config.payments?.allowLegacyBnbRounding !== true) ||
+            s.payment_decimals !== undefined || s.rounding_quantum_atomic !== undefined || quote.allocation_strategy !== "legacy")) ||
+          s.token_decimals !== 18 || token.decimals !== 18 || token.kind !== "native" ||
+          s.token_symbol !== "BNB" || s.payment_mode !== "amount" || s.allocation_strategy !== quote.allocation_strategy ||
+          !(order.mode === "demo" ? s.price_source === "demo_fixed" : s.price_source === "coinbase_spot") ||
+          !Number.isFinite(Date.parse(quote.created_at)) || !Number.isFinite(Date.parse(quote.expires_at))) return null;
+      const pricing = this.get("SELECT fiat_total FROM order_pricing WHERE order_id=?", order.order_id);
+      if (!pricing) return null;
+      const cents = decimalAtomic(pricing.fiat_total, 2);
+      const pn = snapshotInteger(s.price_numerator), pd = snapshotInteger(s.price_denominator);
+      const fn = snapshotInteger(s.fiat_numerator), fd = snapshotInteger(s.fiat_denominator);
+      const units = 10n ** 18n, exact = snapshotInteger(quote.payable_atomic);
+      const preciseBase = ceilDivide(cents * fn * pd * units, 100n * fd * pn);
+      const base = newQuote ? ceilDivide(preciseBase, newQuantum) * newQuantum : preciseBase;
+      const target = ceilDivide(cents * fn * USD_SCALE, 100n * fd);
+      const value = ceilDivide(exact * pn * USD_SCALE, units * pd);
+      // 兼容旧款固定为八位，不能随新报价精度配置而扩大。
+      const quantum = newQuote ? newQuantum : 10000000000n;
+      const rounded = ceilDivide(exact, quantum) * quantum;
+      const roundedValue = ceilDivide(rounded * pn * USD_SCALE, units * pd);
+      const savedLimit = decimalAtomic(s.fingerprint_limit_usd, 18);
+      const budget = [target / 100n, USD_SCALE / 100n, savedLimit].reduce((a, b) => a < b ? a : b);
+      if (cents <= 0n || base <= 0n || exact < base || (newQuote ? rounded !== exact : rounded <= exact) ||
+          s.base_payable_atomic !== base.toString() || s.usd_target_atomic !== target.toString() ||
+          s.usd_atomic !== value.toString() || value < target || roundedValue - target > budget) return null;
+      if (quote.allocation_strategy === "conflict_only" &&
+          (s.amount_exact !== true || snapshotInteger(s.conflict_step_atomic) % newQuantum !== 0n)) return null;
+      return rounded;
+    } catch { return null; }
+  }
+  bnbQuoteCandidates(tx, address, mode) {
+    if (tx.chain !== "bsc" || tx.token_id !== "bsc-bnb") return [];
+    const timestamp = Date.parse(tx.block_time), amount = String(tx.amount_atomic);
+    // 旧报价永久占用：过期、已付、已取消及切换过的报价仍阻挡后来的相同金额。
+    return this.all(
+      "SELECT q.* FROM amount_reservations q JOIN orders o ON o.order_id=q.order_id WHERE q.chain=? AND q.token_id=? AND q.pay_address=? AND q.payment_reference IS NULL AND o.mode=? AND o.merchant_id=? AND o.project_id=?",
+      tx.chain, tx.token_id, address.address, mode, address.merchant_id, address.project_id,
+    ).filter(quote => {
+      if (timestamp < Math.floor(Date.parse(quote.created_at) / 1000) * 1000) return false;
+      if (quote.allocation_strategy === "conflict_only" && timestamp > Date.parse(quote.expires_at)) return false;
+      if (quote.payable_atomic === amount) return true;
+      const owner = this.get("SELECT * FROM orders WHERE order_id=?", quote.order_id);
+      return this.legacyBnbRoundedAmount(owner, quote)?.toString() === amount;
+    });
+  }
+  recoverableBnbTransfer(tx) {
+    if (tx.mode !== "live" ||
+        tx.chain !== "bsc" || tx.token_id !== "bsc-bnb" || tx.removed ||
+        tx.payment_reference || tx.payment_reference_invalid ||
+        ["ambiguous_amount", "duplicate_payment", "reorg_after_payment", "invalid_payment_reference"].includes(tx.reason)) return false;
+    const address = this.get("SELECT * FROM addresses WHERE chain=? AND address=? AND mode='live'", tx.chain, tx.to_address);
+    if (!address || address.merchant_id !== tx.merchant_id || address.project_id !== tx.project_id) return false;
+    const candidates = this.bnbQuoteCandidates(tx, address, "live");
+    if (candidates.length !== 1) return false;
+    const q = candidates[0], o = this.get("SELECT * FROM orders WHERE order_id=?", q.order_id);
+    const time = Date.parse(tx.block_time);
+    return !!o && this.bnbQuoteAmount(o, q) !== null &&
+      o.payment_mode === "amount" && o.chain === q.chain && o.token_id === q.token_id &&
+      o.pay_address === q.pay_address && o.payable_atomic === q.payable_atomic &&
+      ["pending", "expired", "confirming", "review"].includes(o.status) && o.paid_source !== "manual" &&
+      (!tx.order_id || tx.order_id === o.order_id) && (!o.transfer_id || o.transfer_id === tx.id) &&
+      time >= (tx.amount_atomic === q.payable_atomic ? Math.floor(Date.parse(q.created_at) / 1000) * 1000 : Date.parse(q.created_at)) &&
+      time <= Date.parse(q.expires_at) && time <= Date.parse(o.expires_at);
   }
   linkedTransfer(order) {
     if (!order.transfer_id) return null;
@@ -945,6 +1114,7 @@ export class Store {
       paid_source: null,
       payment_mode: this.paymentPolicy(m, project.id).payment_mode,
       payment_reference: null,
+      allocation_strategy: "legacy",
     };
     return this.transaction(() => {
       if (!skipLimits) this.callHook("enforceLimits", m, "orders", project.id);
@@ -1079,6 +1249,13 @@ export class Store {
       ).find(q => addresses.some(a => a.address === q.pay_address));
       if (previous) return this.restoreReferenceQuote(order, previous, network, emitEvent);
     }
+    if (!reference) {
+      const previous = this.all(
+        "SELECT * FROM amount_reservations WHERE order_id=? AND chain=? AND token_id=? AND allocation_strategy='conflict_only' ORDER BY created_at",
+        order.order_id, chain, tokenId,
+      ).find(q => addresses.some(a => a.address === q.pay_address));
+      if (previous) return this.restoreConflictQuote(order, previous, network, emitEvent);
+    }
     const pricing = this.get(
       "SELECT * FROM order_pricing WHERE order_id=?",
       order.order_id,
@@ -1090,25 +1267,42 @@ export class Store {
       chain,
       tokenId,
     );
-    const { amount, decimals, rate, step } = quoteData;
+    const { amount, decimals, rate } = quoteData;
+    const conflict = reference ? null : this.conflictAllocation(tokenId, decimals);
+    const step = conflict?.step || quoteData.step;
     const base = amount;
     let allocated = reference ? base : undefined, address = reference ? addresses[0] : undefined;
     for (const candidateAddress of reference ? [] : addresses) {
-      for (let i = 1; i <= 9999; i++) {
+      const blocked = conflict ? this.conflictAmountReservations(chain, tokenId, candidateAddress.address, Date.now()) : [];
+      // 即使兼容开关尚未开启，新 BNB 报价也不能占用旧报价的八位向上取整金额。
+      const bnbReserved = tokenId === "bsc-bnb" && !conflict ? new Set(this.all(
+        "SELECT * FROM amount_reservations WHERE chain=? AND token_id=? AND pay_address=? AND payment_reference IS NULL",
+        chain, tokenId, candidateAddress.address,
+      ).flatMap(quote => {
+        const owner = this.get("SELECT * FROM orders WHERE order_id=?", quote.order_id);
+        const rounded = owner && this.legacyBnbRoundedAmount(owner, quote, { force: true });
+        return [quote.payable_atomic, ...(rounded ? [rounded.toString()] : [])];
+      })) : null;
+      for (let i = conflict ? 0 : 1; i <= (conflict ? 99999 : 9999); i++) {
         const candidate = base + BigInt(i) * step;
         if (
           candidate - base > quoteData.maxDelta ||
           quoteData.usdValue(candidate) - quoteData.usdTarget > quoteData.budget
         )
           break;
+        const blockedRange = conflict && blocked.find(([minimum, maximum]) => candidate >= minimum && candidate <= maximum);
+        if (blockedRange) {
+          // 直接跳过旧容差区间，避免逐个尾数反复读取数据库。
+          const lastBlocked = (blockedRange[1] - base) / step;
+          i = Number(lastBlocked > 99999n ? 99999n : lastBlocked);
+          continue;
+        }
+        if (bnbReserved?.has(candidate.toString())) continue;
         if (
-          !this.get(
-            "SELECT order_id FROM amount_reservations WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=? AND payment_reference IS NULL",
-            chain,
-            tokenId,
-            candidateAddress.address,
-            candidate.toString(),
-          )
+          conflict || !this.get(
+              "SELECT order_id FROM amount_reservations WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=? AND payment_reference IS NULL",
+              chain, tokenId, candidateAddress.address, candidate.toString(),
+            )
         ) {
           allocated = candidate;
           address = candidateAddress;
@@ -1123,6 +1317,8 @@ export class Store {
     const snapshot = {
       ...quoteData.snapshot,
       payment_mode: reference ? "reference" : "amount",
+      allocation_strategy: conflict ? "conflict_only" : "legacy",
+      ...(conflict ? { conflict_step_atomic: String(step), amount_exact: true } : {}),
       usd_atomic: String(usdAtomic),
       usd_value: formatAtomic(usdAtomic, 18),
       fingerprint_usd: formatAtomic(reference ? 0n : usdAtomic - quoteData.usdTarget, 18),
@@ -1163,7 +1359,7 @@ export class Store {
     snapshot.required_confirmations = required;
     const paymentReference = reference ? "0x" + randomBytes(32).toString("hex") : null;
     this.run(
-      "INSERT INTO amount_reservations(chain,token_id,pay_address,payable_atomic,order_id,created_at,rate,pricing_json,payment_reference) VALUES(?,?,?,?,?,?,?,?,?)",
+      "INSERT INTO amount_reservations(chain,token_id,pay_address,payable_atomic,order_id,created_at,rate,pricing_json,payment_reference,allocation_strategy,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
       chain,
       tokenId,
       address.address,
@@ -1173,18 +1369,21 @@ export class Store {
       rate,
       JSON.stringify(snapshot),
       paymentReference,
+      conflict ? "conflict_only" : "legacy",
+      expiresAt,
     );
     this.run(
-      "UPDATE orders SET status='pending',chain=?,token_id=?,pay_address=?,payable_atomic=?,payable_amount=?,required_confirmations=?,expires_at=?,payment_started_at=COALESCE(payment_started_at,?),payment_reference=? WHERE order_id=?",
+      "UPDATE orders SET status='pending',chain=?,token_id=?,pay_address=?,payable_atomic=?,payable_amount=?,required_confirmations=?,expires_at=?,payment_started_at=COALESCE(payment_started_at,?),payment_reference=?,allocation_strategy=? WHERE order_id=?",
       chain,
       tokenId,
       address.address,
       allocated.toString(),
-      reference ? compactTokenAmount(allocated, decimals) : formatAtomic(allocated, decimals),
+      reference || conflict || tokenId === "bsc-bnb" ? compactTokenAmount(allocated, decimals) : formatAtomic(allocated, decimals),
       required,
       expiresAt,
       selectedAt,
       paymentReference,
+      conflict ? "conflict_only" : "legacy",
       order.order_id,
     );
     const updated = this.get(
@@ -1255,6 +1454,13 @@ export class Store {
       payable_amount: o.payable_amount,
       payment_mode: o.payment_mode || "amount",
       wallet_payment: this.walletPayment(o),
+      amount_matching: quote?.allocation_strategy === "conflict_only" && quoteSnapshot?.allocation_strategy === "conflict_only" ? {
+        strategy: "conflict_only",
+        base_amount: compactTokenAmount(quoteSnapshot.base_payable_atomic, spec.decimals),
+        increment: compactTokenAmount(quoteSnapshot.conflict_step_atomic, spec.decimals),
+        adjustment: compactTokenAmount(BigInt(quote.payable_atomic) - BigInt(quoteSnapshot.base_payable_atomic), spec.decimals),
+        exact: true,
+      } : null,
       fulfillment_status: o.status === "review" && this.linkedTransfer(o)?.reason === "stock_unavailable"
         ? "waiting_stock" : null,
       payment_tolerance: bounds ? {
@@ -1602,11 +1808,58 @@ export class Store {
         this.run("UPDATE transfers SET reason='missing_payment_reference' WHERE id=?", id);
         return { matched: false };
       }
+      if (!o && !paymentReference && tx.chain === "bsc" && tx.token_id === "bsc-bnb") {
+        const candidates = this.bnbQuoteCandidates(row, addr, mode);
+        if (candidates.length > 1) {
+          this.run("UPDATE transfers SET reason='ambiguous_amount' WHERE id=?", id);
+          return { matched: false };
+        }
+        if (candidates.length === 1) {
+          const selected = candidates[0];
+          o = this.get("SELECT * FROM orders WHERE order_id=?", selected.order_id);
+          if (!o || o.payment_mode !== "amount" || o.chain !== selected.chain ||
+              o.token_id !== selected.token_id || o.pay_address !== selected.pay_address || o.payable_atomic !== selected.payable_atomic) {
+            this.run("UPDATE transfers SET reason='superseded_payment_method' WHERE id=?", id);
+            return { matched: false };
+          }
+        }
+      }
+      if (!o && !paymentReference) {
+        const candidates = this.conflictQuoteCandidates(row, addr, mode);
+        if (candidates.length > 1) {
+          this.run("UPDATE transfers SET reason='ambiguous_amount' WHERE id=?", id);
+          return { matched: false };
+        }
+        if (candidates.length === 1) {
+          const selected = candidates[0];
+          if (this.config.payments?.allowFingerprintUnderpayment === true && isKnownStable(tx.token_id)) {
+            // 配置后来开启旧容差时，也不能让精确新报价抢走旧单可能收到的款项。
+            const legacyQuotes = this.all(
+              "SELECT r.* FROM amount_reservations r JOIN orders o ON o.order_id=r.order_id WHERE r.chain=? AND r.token_id=? AND r.pay_address=? AND r.allocation_strategy='legacy' AND r.payment_reference IS NULL AND o.mode=? AND o.merchant_id=? AND o.project_id=?",
+              tx.chain, tx.token_id, normalized, mode, addr.merchant_id, addr.project_id,
+            );
+            if (legacyQuotes.some(legacy => {
+              const owner = this.get("SELECT * FROM orders WHERE order_id=?", legacy.order_id);
+              return owner && Date.parse(row.block_time) >= Math.floor(Date.parse(legacy.created_at) / 1000) * 1000 &&
+                this.paymentAmountMatches(owner, row.amount_atomic, legacy);
+            })) {
+              this.run("UPDATE transfers SET reason='ambiguous_amount' WHERE id=?", id);
+              return { matched: false };
+            }
+          }
+          o = this.get("SELECT * FROM orders WHERE order_id=?", selected.order_id);
+          if (!o || o.allocation_strategy !== "conflict_only" || o.chain !== selected.chain ||
+              o.token_id !== selected.token_id || o.pay_address !== selected.pay_address || o.payable_atomic !== selected.payable_atomic) {
+            this.run("UPDATE transfers SET reason='superseded_payment_method' WHERE id=?", id);
+            return { matched: false };
+          }
+        }
+      }
       const tolerant = this.config.payments?.allowFingerprintUnderpayment === true && isKnownStable(tx.token_id);
       if (!o && tolerant) {
         const candidates = new Map();
         const reservations = this.all(
-          "SELECT r.* FROM amount_reservations r JOIN orders o ON o.order_id=r.order_id WHERE r.chain=? AND r.token_id=? AND r.pay_address=? AND o.merchant_id=? AND o.project_id=? AND o.mode=? AND o.payment_mode='amount' AND r.payment_reference IS NULL",
+          "SELECT r.* FROM amount_reservations r JOIN orders o ON o.order_id=r.order_id WHERE r.chain=? AND r.token_id=? AND r.pay_address=? AND o.merchant_id=? AND o.project_id=? AND o.mode=? AND o.payment_mode='amount' AND r.payment_reference IS NULL AND r.allocation_strategy='legacy'",
           tx.chain, tx.token_id, normalized, addr.merchant_id, addr.project_id, mode,
         );
         for (const quote of reservations) {
@@ -1638,7 +1891,7 @@ export class Store {
         }
       }
       if (!o) o = this.get(
-        "SELECT * FROM orders WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=? AND mode=? AND payment_mode='amount'",
+        "SELECT * FROM orders WHERE chain=? AND token_id=? AND pay_address=? AND payable_atomic=? AND mode=? AND payment_mode='amount' AND allocation_strategy='legacy'",
         tx.chain, tx.token_id, normalized, String(tx.amount_atomic), mode,
       );
       if (!o) {
@@ -1671,7 +1924,7 @@ export class Store {
             "UPDATE transfers SET reason='reorg_after_payment' WHERE id=?",
             id,
           );
-        if ((tolerant || o.payment_mode === "reference") && o.transfer_id !== id) {
+        if ((tolerant || o.token_id === "bsc-bnb" || o.payment_mode === "reference" || o.allocation_strategy === "conflict_only") && o.transfer_id !== id) {
           this.run("UPDATE transfers SET reason='duplicate_payment' WHERE id=?", id);
           return { matched: false };
         }
@@ -1687,8 +1940,11 @@ export class Store {
         return { matched: false };
       }
       const quote = this.orderQuote(o);
-      const recoverExpired = o.status === "expired" && o.payment_mode === "reference" &&
-        quote?.payment_reference === paymentReference && !!paymentReference && o.paid_source !== "manual";
+      const bnbRounded = this.bnbQuoteAmount(o, quote, { force: previous?.order_id === o.order_id });
+      const recoverExpired = o.status === "expired" && o.paid_source !== "manual" &&
+        ((o.payment_mode === "reference" && quote?.payment_reference === paymentReference && !!paymentReference) ||
+          (o.allocation_strategy === "conflict_only" && quote?.allocation_strategy === "conflict_only" && !paymentReference) ||
+          (bnbRounded !== null && !paymentReference));
       if (o.status === "expired" && !recoverExpired) {
         this.run(
           "UPDATE transfers SET reason='expired_order_requires_review' WHERE id=?",
@@ -1703,6 +1959,7 @@ export class Store {
       if (
         blockTime < minimumTime ||
         blockTime > Date.parse(o.expires_at) ||
+        (bnbRounded !== null && blockTime > Date.parse(quote.expires_at)) ||
         ["canceled"].includes(o.status)
       ) {
         this.run(

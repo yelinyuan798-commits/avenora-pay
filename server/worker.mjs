@@ -60,14 +60,56 @@ export function createWorker({
         AND unixepoch(t.block_time)>=unixepoch(COALESCE(q.created_at,d.payment_started_at,d.created_at))
         AND julianday(t.block_time)<=julianday(d.expires_at)
     )` : "";
-    return store.all(`
+    // 切回原来的精确报价后，付款可能已离开近期重扫窗口。
+    // 这里只安排原区块重新核验，不能将数据库中的历史记录直接认作到账。
+    const conflictCandidate = automaticRecovery() && hasReferences ? ` OR EXISTS (
+      SELECT 1 FROM amount_reservations q JOIN orders d ON d.order_id=q.order_id
+      WHERE q.allocation_strategy='conflict_only' AND q.payment_reference IS NULL
+        AND t.payment_reference IS NULL
+        AND q.chain=t.chain AND q.token_id=t.token_id
+        AND q.pay_address=t.to_address AND q.payable_atomic=t.amount_atomic
+        AND d.merchant_id=t.merchant_id AND d.project_id=t.project_id
+        AND d.mode='live' AND d.chain=q.chain AND d.token_id=q.token_id
+        AND d.pay_address=q.pay_address AND d.payable_atomic=q.payable_atomic
+        AND d.payment_mode='amount' AND d.payment_reference IS NULL
+        AND d.allocation_strategy='conflict_only'
+        AND d.status IN ('pending','expired','confirming','review')
+        AND (t.reason IS NULL OR t.reason NOT IN ('ambiguous_amount','duplicate_payment','reorg_after_payment','invalid_payment_reference'))
+        AND (t.order_id IS NULL OR t.order_id=d.order_id)
+        AND (d.transfer_id IS NULL OR d.transfer_id=t.id)
+        AND unixepoch(t.block_time)>=unixepoch(q.created_at)
+        AND julianday(t.block_time)<=julianday(q.expires_at)
+        AND julianday(t.block_time)<=julianday(d.expires_at)
+        AND (SELECT COUNT(*) FROM amount_reservations x JOIN orders owner ON owner.order_id=x.order_id
+          WHERE x.allocation_strategy='conflict_only' AND x.payment_reference IS NULL
+            AND x.chain=t.chain AND x.token_id=t.token_id
+            AND x.pay_address=t.to_address AND x.payable_atomic=t.amount_atomic
+            AND owner.mode='live' AND owner.merchant_id=t.merchant_id AND owner.project_id=t.project_id
+            AND unixepoch(t.block_time)>=unixepoch(x.created_at)
+            AND julianday(t.block_time)<=julianday(x.expires_at))=1
+    )` : "";
+    const blocks = store.all(`
       SELECT DISTINCT t.block_height FROM transfers t
       LEFT JOIN orders o ON o.transfer_id=t.id
       WHERE t.chain=? AND t.mode='live' AND t.removed=0
         ${hasReferences ? "AND COALESCE(t.payment_reference_invalid,0)=0" : ""} AND (
         (t.confirmed=0 AND (o.order_id IS NULL OR o.status NOT IN ('paid','expired','canceled')))
-        OR o.status IN ('confirming','review')${referenceCandidate}
+        OR o.status IN ('confirming','review')${referenceCandidate}${conflictCandidate}
       ) ORDER BY t.block_height`, chain);
+    if (automaticRecovery() && chain === "bsc") {
+      // BigInt 金额和唯一归属交给核心校验；这里只加入待重新读取的原始区块。
+      for (const tx of store.all(`SELECT t.* FROM transfers t WHERE t.chain='bsc' AND t.token_id='bsc-bnb'
+        AND t.mode='live' AND t.removed=0 AND t.payment_reference IS NULL AND COALESCE(t.payment_reference_invalid,0)=0
+        AND (t.reason IS NULL OR t.reason NOT IN ('ambiguous_amount','duplicate_payment','reorg_after_payment','invalid_payment_reference'))
+        AND EXISTS (SELECT 1 FROM orders o WHERE o.chain=t.chain AND o.token_id=t.token_id AND o.pay_address=t.to_address
+          AND o.merchant_id=t.merchant_id AND o.project_id=t.project_id AND o.mode=t.mode
+          AND o.status IN ('pending','expired','confirming','review')
+          AND (t.order_id IS NULL OR t.order_id=o.order_id) AND (o.transfer_id IS NULL OR o.transfer_id=t.id)
+          AND unixepoch(t.block_time)>=unixepoch(COALESCE(o.payment_started_at,o.created_at))
+          AND julianday(t.block_time)<=julianday(o.expires_at)) ORDER BY t.block_height`))
+        if (store.recoverableBnbTransfer(tx)) blocks.push({ block_height: tx.block_height });
+    }
+    return [...new Map(blocks.map(row => [row.block_height, row])).values()].sort((a, b) => a.block_height - b.block_height);
   }
   function syncRecoveryJobs(chain) {
     const needed = new Set(recoveryBlocks(chain).map((row) => row.block_height));
