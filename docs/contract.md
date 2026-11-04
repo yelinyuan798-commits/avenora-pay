@@ -27,6 +27,13 @@ Original compatible external API: signed /v1/whoami, /v1/orders GET/POST, /v1/or
 Chain scanner module `server/chains.mjs` exports `registry`, `validateAddress(chain,address)`, `scanChain({chain,addresses,fromBlock,toBlock,config,fetchImpl?}) -> {transactions:[{id,chain,token_id,tx_hash,event_index,to_address,from_address,amount_atomic,block_height,block_hash,block_time,confirmations,confirmed,removed}],cursor,head}`. config from server-only JSON file/env; token contracts/mints/decimals explicitly configured and validated. Never trust symbols, external POSTs or browser state to settle live. Scanning includes persisted cursor, receipt success, canonical block, dedup tx+event, valid time window. Adapter errors leave cursor unchanged. Unsupported/unconfigured methods fail closed. The backend owns worker orchestration, scanner only network decoding.
 
 
+## Conflict-only amount allocation
+
+- Private configuration `payments.amountAllocation: 'conflict_only'`, `payments.conflictStep: '0.0000001'`, `payments.conflictTokens: ['bsc-usdt']` opts supported new amount-mode quotes into base-first allocation. An occupied amount increments by the exact token quantity, never by floating-point arithmetic. Unsupported token precision is rejected, not rounded.
+- Public order `amount_matching` is null for other strategies; new quotes expose `{strategy:'conflict_only',base_amount,increment,adjustment,exact:true}` with decimal strings. They retain `payment_mode:'amount'` and `wallet_payment:null`; `payment_tolerance` must be null even when the legacy waiver is globally enabled.
+- Allocation strategy and quote windows are retained with historical records. Legacy quote uniqueness and old order values remain intact. Conflict-only reuse requires non-overlapping quote windows and excludes unresolved payments; an already paid quote remains occupied through its original deadline.
+- Match full network/token/address/atomic amount and a unique quote window, and retain immutable transaction bindings. A post-deadline late payment after amount reuse has no reliable order identity; do not claim that ordinary transfer matching can distinguish it from a new-order payment. See [pricing and limits](pricing.md#仅在冲突时增加金额).
+
 ## Wallet reference payments
 
 - GET `/api/payment-policies` -> `{policies:[{project_id,payment_mode:'amount'|'reference',available_methods:[{chain,token_id}]}]}`. PUT `/api/projects/:id/payment-policy` `{payment_mode}` requires merchant ownership and the same Origin protection as other merchant writes. Only future orders inherit changed policy.
