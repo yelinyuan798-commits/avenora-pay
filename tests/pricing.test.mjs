@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { PriceBook, parseFixed, fixed, USD_SCALE } from "../server/pricing.mjs";
+import { PriceBook, parseFixed, fixed, USD_SCALE, BNB_PAYMENT_QUANTUM, roundUpBnbPayment } from "../server/pricing.mjs";
 import { Store } from "../server/core.mjs";
 import { initializeBilling } from "../server/billing.mjs";
 
@@ -247,6 +247,56 @@ test("fingerprint bound includes conversion rounding and never raises tiny BTC t
     () => order(f, "bitcoin", "bitcoin-btc", { fiat_amount: "10.00" }),
     (e) => e.code === "AMOUNT_POOL_EXHAUSTED",
   );
+  f.close();
+});
+test("BNB live quotes allocate six-decimal amounts before reserving unique payment quantities", () => {
+  const f = fixture();
+  f.book.recordAsset("BNB", "715.62");
+  const quote = f.book.quote({ tokenId: "bsc-bnb", decimals: 18, fiatAmount: "1.00", currency: "USD", mode: "live" });
+  assert.equal(quote.amount, 1398000000000000n);
+  assert.equal(quote.step, 1000000000000n);
+  assert.equal(quote.snapshot.payment_decimals, 6);
+  assert.equal(quote.snapshot.rounding_quantum_atomic, "1000000000000");
+  assert.equal(quote.snapshot.token_decimals, 18);
+  assert.ok(quote.usdValue(quote.amount) >= quote.usdTarget);
+  assert.equal(roundUpBnbPayment(1397529415052683n), 1398000000000000n);
+  const first = order(f, "bsc", "bsc-bnb", { fiat_amount: "1.00" });
+  const second = order(f, "bsc", "bsc-bnb", { fiat_amount: "1.00" });
+  assert.equal(first.payable_amount, "0.001399");
+  assert.equal(second.payable_amount, "0.0014");
+  assert.equal(parseFixed(first.payable_amount), 1399000000000000n);
+  assert.equal(parseFixed(second.payable_amount), 1400000000000000n);
+  for (const o of [first, second]) {
+    assert.match(o.payable_amount, /^\d+\.\d{1,6}$/);
+    const raw = f.store.ownedOrder(f.m, o.order_id);
+    assert.equal(BigInt(raw.payable_atomic) % BNB_PAYMENT_QUANTUM, 0n);
+    const reserved = f.store.orderQuote(raw);
+    assert.equal(reserved.payable_atomic, raw.payable_atomic);
+    assert.ok(parseFixed(o.pricing.fingerprint_usd) <= parseFixed(o.pricing.fingerprint_limit_usd));
+  }
+  settle(f, first);
+  assert.equal(f.store.ownedOrder(f.m, first.order_id).status, "paid");
+  assert.equal(f.store.ownedOrder(f.m, second.order_id).status, "pending");
+  f.close();
+});
+test("BNB conversion rounding consumes the existing budget and rejects unusable payment precision", () => {
+  const f = fixture();
+  f.book.recordAsset("BNB", "715.62");
+  const quote = f.book.quote({ tokenId: "bsc-bnb", decimals: 18, fiatAmount: "0.10", currency: "USD", mode: "live" });
+  assert.equal(quote.amount % BNB_PAYMENT_QUANTUM, 0n);
+  assert.equal(quote.step % BNB_PAYMENT_QUANTUM, 0n);
+  assert.equal(quote.maxDelta % BNB_PAYMENT_QUANTUM, 0n);
+  assert.ok(quote.step >= BNB_PAYMENT_QUANTUM);
+  assert.ok(quote.usdValue(quote.amount + quote.maxDelta) - quote.usdTarget <= quote.budget);
+  assert.ok(quote.usdValue(quote.amount + quote.maxDelta + BNB_PAYMENT_QUANTUM) - quote.usdTarget > quote.budget);
+  assert.throws(() => order(f, "bsc", "bsc-bnb", { fiat_amount: "0.01" }), e => e.code === "PRICE_AMOUNT_TOO_SMALL");
+  f.book.recordAsset("BNB", "1000000");
+  assert.throws(() => order(f, "bsc", "bsc-bnb", { fiat_amount: "0.01" }), e => e.code === "PRICE_AMOUNT_TOO_SMALL");
+  assert.equal(f.store.get("SELECT COUNT(*) AS n FROM orders").n, 0);
+  assert.throws(() => f.book.quote({ tokenId: "bsc-bnb", decimals: 8, fiatAmount: "1.00", currency: "USD", mode: "live" }), e => e.code === "INVALID_PRICE_CONFIG");
+  const eth = f.book.quote({ tokenId: "ethereum-eth", decimals: 18, fiatAmount: "1.00", currency: "USD", mode: "live" });
+  assert.equal(eth.snapshot.payment_decimals, undefined);
+  assert.equal(eth.snapshot.rounding_quantum_atomic, undefined);
   f.close();
 });
 test("fee, fiat conversion and USD value are locked and settlement ignores later market movements", () => {
