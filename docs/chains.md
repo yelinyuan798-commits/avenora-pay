@@ -121,3 +121,10 @@ Solana 的 cursor 是 slot；Aptos 的 cursor 是 ledger version，不能当成�
 The application requires an explicit non-negative integer `startBlock` for every live chain, in addition to a valid node and token configuration. This avoids silently starting at the latest head and missing a payment made just before the first polling cycle. For Aptos this value is a ledger version, and for Solana it is a slot. Set it to a recent verified position at or before enabling the receiving address. Saved forward cursors take over after a successful scan.
 
 The application persists an independent bounded Bitcoin/EVM reorg sweep cursor in addition to its forward cursor. Recent blocks are rescanned even if they originally contained no matching transfer, while unsettled and inventory-review transfers are checked separately. Live orders expire automatically only after a healthy scanner has verified sufficiently confirmed block timestamps beyond the order deadline. This deliberately delays expiry during node outages or scan backlog.
+
+
+### 可选钱包订单标识
+
+仅显式设置`tokens[].paymentReference:true`的EVM代币会读取原交易输入并验证Avenora订单标识。必须是成功的直接代币transfer，交易的to/from/value、收款人、原子金额、回执、区块及日志均须对应；缺少原交易数据会使该批扫描失败，不能先推进游标。普通无标识转账仍供旧amount订单识别；reference订单必须带正确标识。
+
+目前实际只读兼容性验证覆盖BSC USDT，不能推断所有ERC-20或智能合约钱包兼容。配置例子、附加数据格式及实际钱包验收要求见[钱包支付说明](wallet-payments.md)。
