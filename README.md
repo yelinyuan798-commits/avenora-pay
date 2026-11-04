@@ -1,14 +1,28 @@
 # Avenora Pay
 
-**免费开源的多商户非托管加密货币收款平台。** 客户向商户自己的钱包转账，平台读取链上数据、核对订单并触发自动发货或签名通知。
+**免费开源的 USDT（U）与多币种非托管收款平台，适用于数卡商城、独立站和自建业务系统。** 兼容 DujiaoPay 建单与签名通知协议，可对接 Dujiao-Next 等数卡商城，也可通过支付链接或 API / Webhook 接入其他收款场景。客户向商户自己的钱包转账，平台读取链上数据、核对订单并触发自动发货或签名通知。
 
 Avenora Pay 独立实现，采用 [MIT 许可证](LICENSE)，允许免费使用、商用、修改和分发，须保留许可证要求的版权与许可声明。内置的商户订阅收费模块是可选业务功能，不是使用本项目代码的授权费用。第三方材料保留各自许可，见 [第三方声明](THIRD_PARTY_NOTICES.md)。
 
-*An open-source, self-hosted, non-custodial crypto payment platform. MIT licensed.*
+*An open-source, self-hosted USDT and multi-asset payment platform with DujiaoPay-compatible APIs for Dujiao-Next integrations, payment links and automatic digital delivery. Non-custodial. MIT licensed.*
 
 ![Avenora Pay 演示首页：多币收款与商户工作台](docs/images/overview.png)
 
 > 截图中的金额、订单和地址均为合成演示内容。本项目尚未完成独立安全审计或全部主网的真实收款验收；自动测试与模拟发货不能替代实际部署验收。
+
+## 适用场景与商城接入
+
+| 场景 | 接入与收款方式 |
+| --- | --- |
+| **Dujiao-Next 等数卡商城** | 通过 DujiaoPay 兼容接口创建订单、打开收银台；商城验证付款通知后，按自身流程自动发卡或交付数字商品。 |
+| **独立站与其他电商系统** | 通过签名 API 创建支付订单、查询付款状态，使用 Webhook 将链上到账结果同步到商城。 |
+| **分享链接收 U** | 创建固定金额或由付款人填写金额的支付链接，用于商品、服务或临时收款。 |
+| **自带商品与自动发货** | 在商户后台配置数字商品和库存，付款确认后自动分配并交付库存内容。 |
+| **面向多个商户提供收款服务** | 隔离各商户的项目、地址、订单和密钥，可选启用商户订阅套餐与账单。 |
+
+普通地址转账模式下，客户扫码或复制收款地址付款，无需连接网站钱包；到账金额与确认要求以本单收银台为准。支持 USDT、USDC、BNB 等资产，具体可用币种和网络取决于部署配置。
+
+**商城兼容说明：** 已按 Dujiao-Next 的 DujiaoPay 通道核对接口约定。传统独角数卡（dujiaoka）及其他商城版本需确认所用支付插件，必要时增加适配；外部商城的付款通知与自动发货仍需在实际部署中完成联调验收。接口与签名方式见 [接入约定](docs/contract.md) 和 [Node.js 接入工具](scripts/sdk.mjs)。
 
 ## 快速体验
 
