@@ -1,5 +1,7 @@
 // Prices are server-owned: only fixed Coinbase HTTPS endpoints populate the live cache.
 export const USD_SCALE = 10n ** 18n;
+export const BNB_PAYMENT_DECIMALS = 6;
+export const BNB_PAYMENT_QUANTUM = 10n ** 12n;
 const ASSETS = ["BTC", "ETH", "BNB", "SOL", "TRX", "USDT", "USDC"];
 const TOKEN_ASSETS = {
   "bitcoin-btc": "BTC",
@@ -49,6 +51,9 @@ export const ceilDivide = (a, b) => {
   if (b <= 0n) reject("INVALID_PRICE", "报价分母无效");
   return (a + b - 1n) / b;
 };
+// BNB 链上仍使用 18 位精度，收银台以 6 位为最小付款单位。
+export const roundUpBnbPayment = (value) =>
+  ceilDivide(BigInt(value), BNB_PAYMENT_QUANTUM) * BNB_PAYMENT_QUANTUM;
 export function parseFixed(value, decimals = 18) {
   if (typeof value !== "string" || !/^\d{1,16}(\.\d{1,18})?$/.test(value))
     reject("INVALID_PRICE", "报价必须是有效的十进制字符串");
@@ -234,11 +239,17 @@ export class PriceBook {
       fx = this.fiat(currency, mode),
       cents = parseFixed(fiatAmount, 2),
       units = 10n ** BigInt(decimals);
-    const amount = ceilDivide(
+    let amount = ceilDivide(
       cents * fx.n * price.d * units,
       100n * fx.d * price.n,
     );
     const usdTarget = ceilDivide(cents * fx.n * USD_SCALE, 100n * fx.d);
+    const walletPrecision = tokenId === "bsc-bnb";
+    if (walletPrecision) {
+      if (decimals !== 18)
+        reject("INVALID_PRICE_CONFIG", "BNB 链上精度须为18位");
+      amount = roundUpBnbPayment(amount);
+    }
     if (amount <= 0n) reject("PRICE_AMOUNT_TOO_SMALL", "付款金额过小");
     if (asset === "BTC" && amount < 546n)
       reject(
@@ -249,12 +260,25 @@ export class PriceBook {
     if (maxUsd > parseFixed("0.01"))
       reject("INVALID_PRICE_CONFIG", "支付尾差上限不可超过0.01美元");
     const budget = usdTarget / 100n < maxUsd ? usdTarget / 100n : maxUsd;
-    const maxDelta = (budget * units * price.d) / (price.n * USD_SCALE);
+    let maxDelta = (budget * units * price.d) / (price.n * USD_SCALE);
     let step = ceilDivide(
       parseFixed("0.0001") * units * price.d,
       price.n * USD_SCALE,
     );
     while (step > maxDelta && step > 1n) step = step / 10n || 1n;
+    if (walletPrecision) {
+      // 取整和识别尾差共同占用原预算，不能因方便输入而额外加价。
+      const affordable = ((usdTarget + budget) * units * price.d) /
+        (price.n * USD_SCALE) - amount;
+      maxDelta = (affordable / BNB_PAYMENT_QUANTUM) * BNB_PAYMENT_QUANTUM;
+      if (affordable < BNB_PAYMENT_QUANTUM)
+        reject("PRICE_AMOUNT_TOO_SMALL", "该金额无法在尾差限制内分配6位BNB付款数量");
+      let stepUnits = ceilDivide(step, BNB_PAYMENT_QUANTUM);
+      const availableUnits = maxDelta / BNB_PAYMENT_QUANTUM;
+      while (stepUnits > availableUnits && stepUnits > 1n)
+        stepUnits = stepUnits / 10n || 1n;
+      step = stepUnits * BNB_PAYMENT_QUANTUM;
+    }
     if (maxDelta < 1n)
       reject(
         "PRICE_AMOUNT_TOO_SMALL",
@@ -283,6 +307,10 @@ export class PriceBook {
       usd_target_atomic: String(usdTarget),
       base_payable_atomic: String(amount),
       fingerprint_limit_usd: fixed(budget),
+      ...(walletPrecision ? {
+        payment_decimals: BNB_PAYMENT_DECIMALS,
+        rounding_quantum_atomic: String(BNB_PAYMENT_QUANTUM),
+      } : {}),
     };
     return {
       amount,

@@ -60,6 +60,7 @@ import {
 import QRCode from "qrcode";
 import { downloadCsv } from "./csv.js";
 import { displayAmount, tokenSymbol, pricingSourceLabel } from "./money.js";
+import { checkoutAmountRules } from "./checkout-amount.mjs";
 import { api, mutate, setProjectScope } from "./api.js";
 import { sendWalletPayment, isTransactionHash } from "./wallet-payment.mjs";
 
@@ -4563,9 +4564,11 @@ function Checkout({ token }) {
   const isBscUsdt = data?.chain === "bsc" && tokenSymbol(data) === "USDT";
   const referencePayment = data?.payment_mode === "reference";
   const waitingStock = data?.fulfillment_status === "waiting_stock";
+  const amountRules = checkoutAmountRules(data || {});
   // The server supplies the exact lower bound; never derive it by rounding the quote.
   const tolerance = data?.payment_tolerance;
   const paymentTolerance =
+    amountRules.allowTolerance &&
     tolerance?.enabled === true &&
     tolerance.kind === "fingerprint_only" &&
     tolerance.requires_unique_order === true &&
@@ -4912,12 +4915,12 @@ function Checkout({ token }) {
                     </small>
                     <h1 className="checkout-payable">
                       <span className="exact-token-amount">
-                        {displayAmount(data.payable_amount)}
+                        {displayAmount(amountRules.payable)}
                       </span>
                       <span className="checkout-payable-unit">
                         <em>{tokenSymbol(data)}</em>
                         <CopyButton
-                          value={data.payable_amount}
+                          value={amountRules.payable}
                           label="复制完整应付金额"
                         />
                       </span>
@@ -4931,7 +4934,7 @@ function Checkout({ token }) {
                         </strong>
                       </div>
                     )}
-                    {!paymentTolerance && isBscUsdt && (
+                    {!paymentTolerance && (isBscUsdt || amountRules.conflictOnly) && (
                       <p className="checkout-exact-match">
                         实际到账金额必须与上方绿色数字完全一致
                       </p>
@@ -4965,20 +4968,22 @@ function Checkout({ token }) {
                         <b>不要多转，也不要少转</b>
                         {isBscUsdt ? (
                           <p>
-                            {"扣除交易所提现手续费后，收款地址必须实际收到 "}
+                            {amountRules.conflictOnly
+                              ? "收款地址必须实际收到 "
+                              : "扣除交易所提现手续费后，收款地址必须实际收到 "}
                             <strong>
-                              {displayAmount(data.payable_amount)} USDT
+                              {displayAmount(amountRules.payable)} USDT
                             </strong>
-                            {
-                              "，“预计到账”须与上方金额完全一致。若手续费从提现数量中扣除，请增加发送数量；例如使用币安提现，若本次从发送数量中扣除 0.1 USDT，就在应到账数量上多发送 0.1 USDT，具体以本次提现页面显示的实际手续费为准。链上钱包的Gas使用BNB单独支付，不会从USDT金额中扣除。"
-                            }
+                            {amountRules.conflictOnly
+                              ? "。使用交易所提现时，请确认“预计到账”与上方金额完全一致；若平台从提现数量中扣手续费，请在交易所端增加发送数量。链上钱包的Gas使用BNB单独支付，不会从USDT金额中扣除。"
+                              : "，“预计到账”须与上方金额完全一致。若手续费从提现数量中扣除，请增加发送数量；例如使用币安提现，若本次从发送数量中扣除 0.1 USDT，就在应到账数量上多发送 0.1 USDT，具体以本次提现页面显示的实际手续费为准。链上钱包的Gas使用BNB单独支付，不会从USDT金额中扣除。"}
                           </p>
                         ) : (
                           <>
                             <p>
                               {"本单收款地址必须实际收到 "}
                               <strong>
-                                {displayAmount(data.payable_amount)}{" "}
+                                {displayAmount(amountRules.payable)}{" "}
                                 {tokenSymbol(data)}
                               </strong>
                               {"，到账数量须完全一致。"}
@@ -5020,6 +5025,24 @@ function Checkout({ token }) {
                       />
                     </div>
                   </div>
+                  {amountRules.matching && (
+                    <div className="checkout-instructions">
+                      <p><b>系统如何识别这一笔付款？</b></p>
+                      <p>
+                        没有金额冲突时按原价付款；同一收款地址的金额已被占用时，
+                        每次增加 {amountRules.matching.increment} {tokenSymbol(data)}，
+                        以本单上方的完整应付金额为准。
+                      </p>
+                      {amountRules.matching.adjusted && (
+                        <p>
+                          本单基础金额 {amountRules.matching.baseAmount} {tokenSymbol(data)}，
+                          为区分订单增加 {amountRules.matching.adjustment} {tokenSymbol(data)}。
+                          请勿省略小数尾数、合并或拆分付款。
+                        </p>
+                      )}
+                      <p>若付款软件不支持完整小数，请勿截短金额转账。</p>
+                    </div>
+                  )}
                   <div className="checkout-progress">
                     <div>
                       <span>
