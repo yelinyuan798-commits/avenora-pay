@@ -1,6 +1,13 @@
+
 # Avenora Pay
 
 **免费开源的 USDT（U）与多币种非托管收款平台，适用于数卡商城、独立站和自建业务系统。** 兼容 DujiaoPay 建单与签名通知协议，可对接 Dujiao-Next 等数卡商城，也可通过支付链接或 API / Webhook 接入其他收款场景。客户向商户自己的钱包转账，平台读取链上数据、核对订单并触发自动发货或签名通知。
+
+[![一键部署到 Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/yelinyuan798-commits/avenora-pay)
+
+[一键部署指南](docs/one-click-deploy.md) · [部署到自己的服务器](docs/deployment.md)
+
+自建用户可点击按钮，在自己的 Render 账户部署网站和后台服务；**云计算与持久磁盘另行收费**，上线后需配置链节点和商户收款地址。使用运营者收款服务的商户，直接访问其网站注册即可，无需自行安装。
 
 Avenora Pay 独立实现，采用 [MIT 许可证](LICENSE)，允许免费使用、商用、修改和分发，须保留许可证要求的版权与许可声明。内置的商户订阅收费模块是可选业务功能，不是使用本项目代码的授权费用。第三方材料保留各自许可，见 [第三方声明](THIRD_PARTY_NOTICES.md)。
 
@@ -90,6 +97,8 @@ BSC 原生 BNB 新报价最多保留6位小数，金额在服务端分配前取�
 
 ## 部署
 
+希望自动准备运行环境、HTTPS 入口和持久数据库，可使用顶部的 **Deploy to Render** 按钮，详见 [一键部署指南](docs/one-click-deploy.md)。已有服务器时按下方步骤部署。
+
 应用需要常驻 Node.js 服务、后台扫描与通知任务、可写的 SQLite 数据库。它不能仅作为静态页面部署，目前按**单实例**设计。
 
 仓库提供 `Dockerfile` 和 `compose.yaml`。当前 Compose 默认是 **live** 模式，并非一键演示配置：
@@ -117,6 +126,7 @@ docker compose up -d --build
 
 ## 文档与检查
 
+- [一键部署与首次配置](docs/one-click-deploy.md)
 - [部署指南](docs/deployment.md)
 - [链配置与适配边界](docs/chains.md)
 - [价格、精确金额与锁价](docs/pricing.md)
