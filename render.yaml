@@ -1,0 +1,31 @@
+# 自建用户的一键部署模板；云计算与持久磁盘由 Render 收费。
+services:
+  - type: web
+    name: avenora-pay
+    runtime: node
+    plan: 0.5c-512mb
+    numInstances: 1
+    autoDeployTrigger: "off"
+    buildCommand: npm ci --include=dev --no-audit --no-fund && npm run build
+    startCommand: node server/render-start.mjs
+    healthCheckPath: /api/auth/me
+    disk:
+      name: avenora-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_VERSION
+        value: "26.4.0"
+      - key: NODE_ENV
+        value: production
+      - key: APP_MODE
+        value: live
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: "8787"
+      - key: DATA_DIR
+        value: /var/data
+      # Render 只在创建变量时生成；入口将 32 字节 base64 转为应用使用的 hex。
+      - key: AVENORA_MASTER_KEY_BASE64
+        generateValue: true
