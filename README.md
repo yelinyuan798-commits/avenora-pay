@@ -5,7 +5,7 @@
 
 [![一键部署到 Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/yelinyuan798-commits/avenora-pay)
 
-[一键部署指南](docs/one-click-deploy.md) · [部署到自己的服务器](docs/deployment.md)
+[商户注册与开通](docs/merchant-onboarding.md) · [一键部署指南](docs/one-click-deploy.md) · [部署到自己的服务器](docs/deployment.md)
 
 自建用户可点击按钮，在自己的 Render 账户部署网站和后台服务；**云计算与持久磁盘另行收费**，上线后需配置链节点和商户收款地址。使用运营者收款服务的商户，直接访问其网站注册即可，无需自行安装。
 
@@ -55,6 +55,7 @@ npm run dev
 - **收款与交付**：支持直接扫码或复制商户地址转账；可配置无冲突时按基础金额收款，冲突时按指定步长递增。另提供交易内订单标识的钱包支付方式。支持链上确认、事务内一次库存分配、签名通知及自动重试。
 - **分享收款**：固定金额或买家自填金额的收款链接；退款模块登记商户申报的外部退款记录，未进行链上核验，也不替商户转币。
 - **商户工作台**：收款统计、订单筛选、当前数据 CSV 导出、品牌展示、支持邮箱和手续费设置。
+- **自助开通**：官网注册、保留所选套餐、继续支付订阅账单，以及项目和收款地址配置指引；只显示部署环境实际开放的网络与币种。
 - **接入能力**：服务端 HMAC 签名、时间窗、请求防重放、建单幂等，以及 Node.js [接入工具](scripts/sdk.mjs)。
 - **可选平台订阅**：套餐、月订阅账单、付款后开通、同档续费、宽限期、资源与 USD 计价额度，以及管理员审计记录。
 - **账户安全**：密码哈希、会话失效、TOTP 两步验证和一次性恢复码；服务端密钥及商品库存加密存储。
@@ -126,6 +127,7 @@ docker compose up -d --build
 
 ## 文档与检查
 
+- [商户注册、订阅与收款配置](docs/merchant-onboarding.md)
 - [一键部署与首次配置](docs/one-click-deploy.md)
 - [部署指南](docs/deployment.md)
 - [链配置与适配边界](docs/chains.md)
