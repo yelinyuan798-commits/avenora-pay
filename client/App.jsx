@@ -68,6 +68,7 @@ const Context = createContext(null);
 const useApp = () => useContext(Context);
 const TITLES = {
   dashboard: "概览",
+  onboarding: "开始收款",
   projects: "项目",
   orders: "订单",
   addresses: "收款地址",
@@ -86,7 +87,7 @@ const TITLES = {
   "platform-invoices": "订阅账单",
 };
 const NAV_GROUPS = [
-  [null, [["dashboard", LayoutDashboard]]],
+  [null, [["dashboard", LayoutDashboard], ["onboarding", CheckCircle2]]],
   [
     "收款",
     [
@@ -183,6 +184,13 @@ const STATUS = {
   voided: ["已作废", "gray"],
   delivery_pending: ["等待投递", "amber"],
 };
+function selectedPlan(search = location.search) {
+  const value = new URLSearchParams(search).get("plan") || "";
+  return /^[a-z0-9_-]{1,40}$/.test(value) ? value : "";
+}
+function planQuery(plan) {
+  return plan ? `?plan=${encodeURIComponent(plan)}` : "";
+}
 function go(path) {
   history.pushState({}, "", path);
   window.dispatchEvent(new PopStateEvent("popstate"));
@@ -545,6 +553,7 @@ function checkoutPath(order) {
 
 export default function App() {
   const [path, setPath] = useState(location.pathname),
+    [search, setSearch] = useState(location.search),
     [auth, setAuth] = useState({ user: null, mode: "demo", loading: true }),
     [toast, setToast] = useState(null),
     [registry, setRegistry] = useState({ chains: [], currencies: ["USD"] }),
@@ -553,7 +562,7 @@ export default function App() {
     [demoBusy, setDemoBusy] = useState(false);
   const demoPending = useRef(false);
   useEffect(() => {
-    const fn = () => setPath(location.pathname);
+    const fn = () => { setPath(location.pathname); setSearch(location.search); };
     addEventListener("popstate", fn);
     return () => removeEventListener("popstate", fn);
   }, []);
@@ -615,6 +624,7 @@ export default function App() {
     demoBusy,
     registry,
     path,
+    search,
     activeProjectId,
     changeProject,
     isAdmin: accountInfo?.is_admin === true,
@@ -787,7 +797,7 @@ function PublicFooter() {
   );
 }
 function Landing() {
-  const { demo, demoBusy, registry, public_demo: publicDemo } = useApp();
+  const { demo, demoBusy, registry, user, public_demo: publicDemo } = useApp();
   const chains = registry.chains || [];
   return (
     <>
@@ -812,16 +822,18 @@ function Landing() {
                 再把支付结果可靠地送达你的业务。
               </p>
               <div className="hero-actions">
-                <button
-                  className="button primary large"
-                  onClick={demo}
-                  disabled={demoBusy}
-                >
-                  {demoBusy ? "正在准备演示空间…" : "体验商户工作台"}
-                  <ArrowRight size={17} />
-                </button>
-                <Link className="button secondary large" to="/docs">
-                  查看接入文档
+                {publicDemo ? (
+                  <button className="button primary large" onClick={demo} disabled={demoBusy}>
+                    {demoBusy ? "正在准备演示空间…" : "体验商户工作台"}
+                    <ArrowRight size={17} />
+                  </button>
+                ) : (
+                  <Link className="button primary large" to={user ? "/merchant/onboarding" : "/merchant/register"}>
+                    {user ? "配置我的收款" : "免费注册商户"}<ArrowRight size={17} />
+                  </Link>
+                )}
+                <Link className="button secondary large" to="/pricing">
+                  查看套餐
                 </Link>
               </div>
               <div className="hero-checks">
@@ -841,7 +853,7 @@ function Landing() {
               <span className="hero-note">
                 {publicDemo
                   ? "公开演示 · 无需注册 · 请勿输入真实资料或转账"
-                  : "Avenora Pay · 演示空间不处理真实转账"}
+                  : "注册账户 → 选择套餐 → 配置公开地址 → 开始收款"}
               </span>
             </div>
             <div className="hero-visual">
@@ -913,20 +925,20 @@ function Landing() {
           <span className="section-kicker">订单生命周期</span>
           <h2>从订单到履约，资金始终直达你的地址</h2>
           <p className="section-description">
-            一次连接，串起收款、确认和自动发货。
+            一次配置，串起收款、确认和自动发货。
           </p>
           <div className="steps-grid">
             {[
               [
                 CreditCard,
                 "生成付款订单",
-                "钱包付款带订单标识，支持同地址、同金额订单；普通转账保留金额识别。",
+                "客户扫码或复制地址，按收银台完整金额转账；同地址订单金额冲突时自动加尾数区分。",
                 "一个收款地址 · 自动区分订单",
               ],
               [
                 Wallet,
                 "客户转入你的地址",
-                "付款在客户与商户钱包之间完成，网关负责观察。",
+                "不需要连接钱包。款项直接进入你的地址，平台自动监测到账。",
                 "customer → your wallet",
               ],
               [
@@ -990,7 +1002,7 @@ function Landing() {
               ))}
             </div>
             <p className="section-footnote">
-              币种与网络需同时匹配。主流币按订单报价锁定金额；这里不展示实时行情。
+              以上为软件可适配的网络。当前平台实际开放的网络和币种，以商户开通指引为准。
             </p>
           </div>
         </section>
@@ -1071,8 +1083,10 @@ function Landing() {
                 "Avenora Pay 是独立运行的非托管支付网关，支持主流加密货币与稳定币收款，连接订单、链上确认和自动发货。商户账户与资金由当前部署独立管理。",
               ],
               [
-                "如何体验完整支付流程？",
-                "进入演示工作台，创建一笔订单，查看收银台，再在订单详情中模拟链上确认。演示订单可验证通知与自动发货，不应实际转账。",
+                "如何开始使用？",
+                publicDemo
+                  ? "进入独立演示空间体验订单、订阅与发货。演示订单只接受模拟付款，请勿真实转账。"
+                  : "注册商户后，按开通指引选择套餐、创建项目、添加公开收款地址。你可以分享收款链接，也可以通过 API 和 Webhook 对接已有商城。",
               ],
               [
                 "需要提供钱包私钥吗？",
@@ -1080,7 +1094,7 @@ function Landing() {
               ],
               [
                 "实际收款需要配置什么？",
-                "需要配置链上节点、收款币种、商户公开地址，以及真实环境域名。主流币还需要可用的报价源；只有实际启用且报价有效的方式能创建真实收款单。",
+                "商户只需选择平台当前开放的网络与币种，并填写该网络的公开收款地址。链上节点由平台维护；自部署用户则需要自行配置。",
               ],
               [
                 "到账后如何自动发货？",
@@ -1104,14 +1118,15 @@ function Landing() {
           </span>
           <h2>把加密货币收款接到你的业务里。</h2>
           <p>创建项目、配置地址，让订单的每个环节都有记录。</p>
-          <button
-            className="button primary large"
-            onClick={demo}
-            disabled={demoBusy}
-          >
-            打开演示工作台
-            <ArrowRight size={16} />
-          </button>
+          {publicDemo ? (
+            <button className="button primary large" onClick={demo} disabled={demoBusy}>
+              打开演示工作台<ArrowRight size={16} />
+            </button>
+          ) : (
+            <Link className="button primary large" to={user ? "/merchant/onboarding" : "/merchant/register"}>
+              {user ? "继续配置收款" : "创建商户账户"}<ArrowRight size={16} />
+            </Link>
+          )}
         </section>
       </main>
       <PublicFooter />
@@ -1126,7 +1141,10 @@ function AuthPage({ register }) {
     demo,
     demoBusy,
     public_demo: publicDemo,
+    mode,
+    search,
   } = useApp();
+  const plan = selectedPlan(search);
   const [busy, setBusy] = useState(false),
     [error, setError] = useState(""),
     [show, setShow] = useState(false),
@@ -1142,7 +1160,7 @@ function AuthPage({ register }) {
         Object.fromEntries(f),
       );
       await refreshAuth();
-      go("/merchant/dashboard");
+      go(plan && plan !== "free" ? `/merchant/usage${planQuery(plan)}` : register || plan === "free" ? "/merchant/onboarding" : "/merchant/dashboard");
     } catch (e) {
       if (e.code === "TOTP_REQUIRED") setOtpRequired(true);
       setError(e.message);
@@ -1294,25 +1312,15 @@ function AuthPage({ register }) {
               </form>
               <p className="auth-switch">
                 {register ? "已有账户？" : "还没有账户？"}
-                <Link to={register ? "/merchant/login" : "/merchant/register"}>
+                <Link to={`${register ? "/merchant/login" : "/merchant/register"}${planQuery(plan)}`}>
                   {register ? "立即登录" : "创建商户账户"}
                 </Link>
               </p>
               <div className="or-divider">
                 <span>或者先了解产品</span>
               </div>
-              <button
-                className="button secondary full"
-                onClick={demo}
-                disabled={demoBusy}
-              >
-                <Sparkles size={16} />
-                进入独立演示空间
-              </button>
-              <p className="auth-footnote">
-                <ShieldCheck size={13} />
-                演示空间不处理真实付款
-              </p>
+              {mode === "demo" ? <button className="button secondary full" onClick={demo} disabled={demoBusy}><Sparkles size={16} />进入独立演示空间</button> : <Link className="button secondary full" to="/pricing"><Layers size={16} />查看套餐与服务</Link>}
+              <p className="auth-footnote"><ShieldCheck size={13} />{mode === "demo" ? "演示空间不处理真实付款" : "注册后按指引配置收款，无需提供钱包私钥"}</p>
             </>
           )}
         </div>
@@ -1322,17 +1330,18 @@ function AuthPage({ register }) {
 }
 
 function MerchantShell({ page }) {
-  const { user, loading, mode, refreshAuth, notify, isAdmin, activeProjectId } =
+  const { user, loading, mode, refreshAuth, notify, isAdmin, activeProjectId, search } =
     useApp();
   const [open, setOpen] = useState(false);
   useEffect(() => {
-    if (!loading && !user) go("/merchant/login");
-  }, [loading, user]);
+    if (!loading && !user) go(`/merchant/login${planQuery(selectedPlan(search))}`);
+  }, [loading, user, search]);
   useEffect(() => setOpen(false), [page]);
   if (loading || !user) return <Spinner />;
   const Page =
     {
       dashboard: Dashboard,
+      onboarding: Onboarding,
       projects: Projects,
       orders: Orders,
       addresses: Addresses,
@@ -1700,6 +1709,11 @@ function Dashboard() {
           创建订单
         </button>
       </PageHeading>
+      <div className="onboarding-banner">
+        <span className="onboarding-banner-icon"><CheckCircle2 size={23} /></span>
+        <div><b>把收款接到你的业务里</b><p>套餐、收款地址和接入方式，在开通指引里一次配好。</p></div>
+        <Link to="/merchant/onboarding" className="button secondary">查看开通进度<ArrowRight size={15} /></Link>
+      </div>
       {error ? (
         <ResourceError error={error} onRetry={reload} />
       ) : loading ? (
@@ -2467,6 +2481,129 @@ function Orders() {
   );
 }
 
+function useRefreshOnReturn(reload) {
+  const callback = useRef(reload);
+  callback.current = reload;
+  useEffect(() => {
+    const refresh = () => { if (document.visibilityState === "visible") callback.current(); };
+    addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => { removeEventListener("focus", refresh); document.removeEventListener("visibilitychange", refresh); };
+  }, []);
+}
+function SetupSection({ number, title, description, complete, children }) {
+  return <section className={`panel setup-section ${complete ? "complete" : ""}`}>
+    <div className="setup-section-heading">
+      <span className="setup-number">{complete ? <Check size={19} /> : number}</span>
+      <div><h2>{title}</h2><p>{description}</p></div>
+      {complete && <span className="setup-done">已配置</span>}
+    </div>
+    <div className="setup-section-body">{children}</div>
+  </section>;
+}
+function Onboarding() {
+  const { user, notify, activeProjectId, changeProject } = useApp();
+  const { data, loading, error, reload } = useLoad(() => api("/api/onboarding"));
+  const [busy, setBusy] = useState(""), [formError, setFormError] = useState("");
+  const [creatingProject, setCreatingProject] = useState(false), [addingAddress, setAddingAddress] = useState(false);
+  const [chainId, setChainId] = useState(""), [tokens, setTokens] = useState(null), [createdLink, setCreatedLink] = useState(null);
+  useRefreshOnReturn(reload);
+  const projects = data?.projects || [];
+  const project = projects.find(p => p.id === activeProjectId) || projects[0];
+  useEffect(() => {
+    if (project && activeProjectId !== project.id) changeProject(project.id);
+  }, [project?.id, activeProjectId]);
+  const chains = data?.supported_chains || [];
+  const chain = chains.find(c => c.id === chainId) || chains[0];
+  const availableTokens = chain?.tokens || [];
+  const tokenIds = tokens ?? availableTokens.map(t => t.id);
+  const pendingInvoice = data?.pending_invoice;
+  async function save(kind, event) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const values = Object.fromEntries(new FormData(form));
+    setBusy(kind); setFormError("");
+    try {
+      if (kind === "project") {
+        const result = await mutate("/api/projects", values);
+        changeProject(result.id); setCreatingProject(false); setCreatedLink(null);
+        notify("项目已创建，接下来配置收款地址");
+      } else if (kind === "address") {
+        if (!project || !chain || !tokenIds.length) throw new Error("请选择可用的收款网络与币种。");
+        await mutate("/api/addresses", { ...values, project_id: project.id, chain: chain.id, token_ids: tokenIds });
+        setAddingAddress(false); setTokens(null); notify("收款地址已保存");
+      } else if (kind === "link") {
+        if (!project?.collection_configured) throw new Error("请先完成收款地址的配置。");
+        const result = await mutate("/api/payment-links", { ...values, name: values.title.slice(0, 80), project_id: project.id, amount_mode: "fixed", currency: "USD" });
+        setCreatedLink({ ...result, project_id: project.id }); notify("收款链接已创建，可以分享给客户");
+      }
+      form.reset(); reload();
+    } catch (e) { setFormError(e.message); } finally { setBusy(""); }
+  }
+  if (loading && !data) return <Spinner />;
+  if (error) return <ResourceError error={error} onRetry={reload} />;
+  const showAddressForm = project && (!project.enabled_address_count || addingAddress);
+  const link = createdLink?.project_id === project?.id ? createdLink : null;
+  return <>
+    <PageHeading title="开始收款" description="从账户到第一笔订单，按下面的步骤配置。进度会自动保存。">
+      <button className="button secondary" onClick={reload} disabled={loading}><RefreshCw size={15} />刷新进度</button>
+    </PageHeading>
+    <div className="setup-welcome">
+      <div><span className="setup-account"><CheckCircle2 size={16} />商户账户已创建</span><h2>{user.name || "欢迎加入"}，准备好接收第一笔付款。</h2><p>收款直接进入你的地址。只填写公开地址，不需要连接钱包、私钥或助记词。</p></div>
+      <ShieldCheck size={48} />
+    </div>
+    {data?.mode === "demo" && <div className="info-note compact"><Sparkles size={18} /><p>这里是独立演示空间，订阅、地址和订单均为模拟，请勿转账。</p></div>}
+    <InlineError error={formError} />
+    <div className="setup-layout">
+      <div className="setup-main">
+        <SetupSection number="1" title="选择适合你的套餐" description="免费计划可直接开始；需要更多资源时再升级。" complete={true}>
+          <div className="setup-plan-summary"><div><b>{data?.plan?.name || "免费计划"}</b><p>{["active", "grace"].includes(data?.subscription?.status) ? `到期时间：${date(data.subscription.expires_at)}` : "账户已具备免费计划额度，无需先支付订阅费。"}</p></div><Link className="button secondary" to="/merchant/usage">查看套餐<ArrowRight size={14} /></Link></div>
+          {pendingInvoice && <div className="setup-pending"><Clock3 size={18} /><div><b>{pendingInvoice.plan_name}{pendingInvoice.payment_status === "confirming" ? "订阅等待链上确认" : "订阅待付款"}</b><p>{pendingInvoice.payment_status === "confirming" ? "已检测到付款，无需重复转账。确认完成后自动开通。" : "支付确认后自动开通；请继续原账单，避免重复付款。"}</p></div><Link to={invoicePath(pendingInvoice)} className="button primary small">{pendingInvoice.payment_status === "confirming" ? "查看付款进度" : "继续支付"}</Link></div>}
+          {!data?.billing_enabled && <p className="setup-muted">{data?.billing_unavailable_reason || "平台暂未开放付费订阅，可先使用免费计划。"}</p>}
+        </SetupSection>
+        <SetupSection number="2" title="建立你的收款项目" description="每个项目独立管理地址、订单和商城接入。" complete={Boolean(project)}>
+          {projects.length > 0 && <div className="setup-project-picker"><Field label="当前配置项目"><select value={project?.id || ""} onChange={e => { changeProject(e.target.value); setAddingAddress(false); setFormError(""); }}>
+            {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select></Field><button className="table-link" onClick={() => setCreatingProject(!creatingProject)}>{creatingProject ? "收起" : "新建项目"}</button></div>}
+          {(!projects.length || creatingProject) && <form className="setup-inline-form" onSubmit={e => save("project", e)}>
+            <Field label="项目名称"><input name="name" required maxLength={80} placeholder="例如：我的数卡商城" /></Field>
+            <button className="button primary" disabled={Boolean(busy)}>{busy === "project" && <LoaderCircle size={15} className="spin" />}创建项目<ArrowRight size={15} /></button>
+          </form>}
+        </SetupSection>
+        <SetupSection number="3" title="配置公开收款地址" description="选择平台已开放的网络与币种，填写你在该网络的地址。" complete={Boolean(project?.collection_configured)}>
+          {!project ? <p className="setup-muted">先创建一个项目，再配置该项目的收款地址。</p> : <>
+            {project.collection_configured && <div className="setup-ready-row"><CheckCircle2 size={20} /><div><b>{project.collection_ready ? "当前项目已可创建收款订单" : "收款地址配置已完成"}</b><p>{(project.configured_methods || project.available_methods).map(m => `${CHAIN_NAMES[m.chain] || m.chain} · ${tokenSymbol({ token_id: m.token_id })}`).join(" / ")}</p></div><button className="table-link" onClick={() => setAddingAddress(!addingAddress)}>{addingAddress ? "收起" : "添加地址"}</button></div>}
+            {project.enabled_address_count > 0 && !project.collection_ready && <div className="setup-unavailable"><Clock3 size={22} /><div><b>地址已保存，等待收款方式就绪</b><p>{project.collection_unavailable_reason || "当前网络、币种或报价暂不可用。无需重复添加相同地址；可稍后刷新，或到地址管理检查配置。"}</p><div className="setup-inline-actions"><button className="table-link" onClick={reload}>刷新状态</button><Link className="table-link" to="/merchant/addresses">管理地址</Link><button className="table-link" onClick={() => setAddingAddress(!addingAddress)}>{addingAddress ? "收起" : "添加其他地址"}</button></div></div></div>}
+            {showAddressForm && (chains.length ? <form onSubmit={e => save("address", e)}>
+              <Field label="收款网络"><select value={chain?.id || ""} onChange={e => { setChainId(e.target.value); setTokens(null); }}>{chains.map(c => <option value={c.id} key={c.id}>{c.name || CHAIN_NAMES[c.id] || c.id}</option>)}</select></Field>
+              <Field label="接收币种"><div className="token-checks">{(chain?.tokens || []).map(t => <label key={t.id} className={!t.quote_ready ? "setup-token-unavailable" : ""}><input type="checkbox" checked={tokenIds.includes(t.id)} onChange={e => setTokens(e.target.checked ? [...tokenIds, t.id] : tokenIds.filter(id => id !== t.id))} /><b>{t.symbol}</b>{!t.quote_ready && <small>{t.unavailable_reason || "报价暂不可用"}</small>}</label>)}</div></Field>
+              <Field label={data.mode === "demo" ? "演示地址标记" : "钱包公开收款地址"} help={data.mode === "demo" ? "请使用 demo: 开头的测试标记。" : "请核对所选网络。客户将直接转账到这里；地址保存后仍由你掌控。"}><input key={chain?.id} name="address" required maxLength={200} autoComplete="off" spellCheck="false" placeholder={data.mode === "demo" ? "demo:my-wallet" : chain?.id === "bitcoin" ? "输入 Bitcoin 主网地址" : "粘贴该网络的公开收款地址"} /></Field>
+              <Field label="地址备注（可选）"><input name="label" maxLength={80} placeholder="例如：商城收款钱包" /></Field>
+              <button className="button primary" disabled={Boolean(busy) || !tokenIds.length}>{busy === "address" && <LoaderCircle size={15} className="spin" />}保存收款地址<ArrowRight size={15} /></button>
+              {project.enabled_address_count > 0 && !project.collection_ready && <p className="setup-muted">已有地址，但当前网络、币种或报价尚未就绪。你可以选择其他可用币种，或稍后刷新进度。</p>}
+            </form> : <div className="setup-unavailable"><Radio size={22} /><div><b>平台暂未开放收款网络</b><p>账户和项目已保存，待平台启用网络后即可继续配置。</p></div></div>)}
+          </>}
+        </SetupSection>
+        <SetupSection number="4" title="选择业务接入方式" description="可直接分享付款页，也可以接入现有商城。" complete={Boolean(project?.setup_configured)}>
+          {!project?.collection_configured ? <p className="setup-muted">配置收款地址后，在这里创建第一个收款链接。</p> : <>
+            {link && <div className="setup-link-result"><CheckCircle2 size={20} /><div><b>收款链接已创建</b><code>{new URL(link.url || `/pay/${link.id}`, location.origin).href}</code></div><CopyButton value={new URL(link.url || `/pay/${link.id}`, location.origin).href} label="复制链接" /><Link to={link.url || `/pay/${link.id}`} className="button secondary small" target="_blank" rel="noreferrer">预览<ExternalLink size={14} /></Link></div>}
+            {project.payment_link_configured ? <div className="setup-ready-row"><Link2 size={20} /><div><b>已启用 {project.payment_links_count} 个收款链接</b><p>{project.collection_ready ? "可以直接分享给客户，付款成功后在订单中查看结果。" : "链接已保存，待收款方式就绪后即可使用。"}</p></div><Link to="/merchant/payment-links" className="button secondary small">管理链接</Link></div> : <form onSubmit={e => save("link", e)}>
+              <div className="setup-option-heading"><Link2 size={19} /><div><h3>直接分享收款链接</h3><p>不需要开发，适合服务费、单次收款等场景。</p></div></div>
+              <div className="form-row"><Field label="付款页标题"><input name="title" required maxLength={120} placeholder="例如：数字创作服务" /></Field><Field label="订单金额（USD）" help="最多两位小数，以收银台报价换算到账币种。"><input name="amount" required inputMode="decimal" pattern="[0-9]+(\.[0-9]{1,2})?" placeholder="例如：9.90" /></Field></div>
+              <button className="button primary" disabled={Boolean(busy)}>{busy === "link" && <LoaderCircle size={15} className="spin" />}创建收款链接<ArrowRight size={15} /></button>
+            </form>}
+            <div className="setup-integration-options">
+              <div><KeyRound size={21} /><h3>接入独角数卡等商城</h3><p>{project.api_integration_configured ? "API 密钥与回调已配置，请在商城中验证签名并完成实际订单测试。" : "创建项目级 API 密钥，设置支付回调，将付款结果送达你的商城。"}</p><div><Link to="/merchant/keys" className="table-link">配置密钥</Link><Link to="/merchant/webhooks" className="table-link">配置回调</Link><Link to="/docs" className="table-link">接入文档</Link></div></div>
+              <div><Package size={21} /><h3>自动发放数字商品</h3><p>{project.digital_delivery_configured ? `已有 ${project.stocked_products_count} 个商品备妥库存，可从订单选择商品收款发货。` : "添加商品与库存，并在建单时关联商品，支付确认后自动分配一份库存。"}</p><div><Link to="/merchant/products" className="table-link">配置商品与库存</Link><Link to="/merchant/orders" className="table-link">创建商品订单</Link></div></div>
+            </div>
+          </>}
+        </SetupSection>
+      </div>
+      <aside className="setup-sidebar"><div className="panel"><h3>开通后，付款如何完成？</h3><ol><li>客户打开收银台，选择网络与币种。</li><li>向你的公开地址转账，不需要连接钱包。</li><li>平台识别到账并等待链上确认。</li><li>通知商城，或发放已配置的商品库存。</li></ol><p>同一地址的并发订单可能需要不同金额。客户应按收银台显示的实际应付金额转账。</p></div><div className="setup-help"><BookOpen size={19} /><div><b>配置完成后测试一笔</b><p>先用小额订单确认真实到账、回调或发货，再分享给客户。配置完成不等于已经验证实际付款。</p><Link to="/docs" className="text-link">查看接入说明<ArrowRight size={14} /></Link></div></div></aside>
+    </div>
+  </>;
+}
+
 function Projects() {
   const { notify } = useApp();
   const { data, loading, error, reload } = useLoad(() => api("/api/projects"));
@@ -2762,7 +2899,7 @@ function PaymentModeSettings({ data, loading, error, reload }) {
 }
 
 function Addresses() {
-  const { registry, mode, notify } = useApp();
+  const { registry, mode, notify, activeProjectId } = useApp();
   const { data, loading, error, reload } = useLoad(async () => {
     const [a, p, policy] = await Promise.all([
       api("/api/addresses"),
@@ -2824,7 +2961,7 @@ function Addresses() {
           className="button primary"
           onClick={() => {
             setAdding(true);
-            setProject(data?.projects?.[0]?.id || "");
+            setProject(activeProjectId || data?.projects?.[0]?.id || "");
             setSelectedTokens(null);
             setFormError("");
           }}
@@ -3047,7 +3184,7 @@ function Addresses() {
 }
 
 function Keys() {
-  const { notify } = useApp();
+  const { notify, activeProjectId } = useApp();
   const { data, loading, error, reload } = useLoad(async () => {
     const [k, p] = await Promise.all([api("/api/keys"), api("/api/projects")]);
     return { ...k, ...p };
@@ -3084,7 +3221,7 @@ function Keys() {
           className="button primary"
           onClick={() => {
             setAdding(true);
-            setProject(data?.projects?.[0]?.id || "");
+            setProject(activeProjectId || data?.projects?.[0]?.id || "");
             setFormError("");
           }}
         >
@@ -3256,7 +3393,7 @@ function Keys() {
 }
 
 function Webhooks() {
-  const { notify } = useApp();
+  const { notify, activeProjectId } = useApp();
   const { data, loading, error, reload } = useLoad(async () => {
     const [w, p] = await Promise.all([
       api("/api/webhooks"),
@@ -3321,7 +3458,7 @@ function Webhooks() {
           className="button secondary"
           onClick={() => {
             setTesting(true);
-            setProject(data?.projects?.[0]?.id || "");
+            setProject(activeProjectId || data?.projects?.[0]?.id || "");
             setFormError("");
           }}
         >
@@ -3333,7 +3470,7 @@ function Webhooks() {
           onClick={() => {
             setEditingEndpoint(null);
             setAdding(true);
-            setProject(data?.projects?.[0]?.id || "");
+            setProject(activeProjectId || data?.projects?.[0]?.id || "");
             setFormError("");
           }}
         >
@@ -3857,7 +3994,7 @@ function Transactions() {
 }
 
 function Products() {
-  const { notify } = useApp();
+  const { notify, activeProjectId } = useApp();
   const { data, loading, error, reload } = useLoad(async () => {
     const [p, j] = await Promise.all([
       api("/api/products"),
@@ -3882,7 +4019,7 @@ function Products() {
           className="button primary"
           onClick={() => {
             setAdding(true);
-            setProject(data?.projects?.[0]?.id || "");
+            setProject(activeProjectId || data?.projects?.[0]?.id || "");
             setFormError("");
           }}
         >
@@ -4773,10 +4910,10 @@ function Checkout({ token }) {
                           : "确认结果会自动更新，无需重复付款。"}
                       </div>
                       <Link
-                        to="/merchant/usage"
+                        to={subscriptionActivated ? "/merchant/onboarding" : "/merchant/usage"}
                         className="button primary full"
                       >
-                        返回套餐与用量
+                        {subscriptionActivated ? "继续配置收款" : "返回套餐与用量"}
                         <ArrowRight size={15} />
                       </Link>
                     </div>
@@ -5305,12 +5442,12 @@ function Pricing() {
                 plan={p}
                 onChoose={() =>
                   user
-                    ? go("/merchant/usage")
+                    ? go(p.id === "free" ? "/merchant/onboarding" : `/merchant/usage${planQuery(p.id)}`)
                     : publicDemo
                       ? demo()
-                      : go("/merchant/register")
+                      : go(`/merchant/register${planQuery(p.id)}`)
                 }
-                buttonText={p.id === "free" ? "免费开始" : "查看套餐详情"}
+                buttonText={p.id === "free" ? "免费开始" : publicDemo ? "体验套餐" : "选择此套餐"}
               />
             ))}
           </div>
@@ -5596,7 +5733,7 @@ function About({ page }) {
 }
 
 function PaymentLinks() {
-  const { notify } = useApp();
+  const { notify, activeProjectId } = useApp();
   const { data, loading, error, reload } = useLoad(async () => {
     const [l, p] = await Promise.all([
       api("/api/payment-links"),
@@ -5611,7 +5748,7 @@ function PaymentLinks() {
     [formError, setFormError] = useState("");
   function edit(l = {}) {
     setEditing(l);
-    setProject(l.project_id || data?.projects?.[0]?.id || "");
+    setProject(l.project_id || activeProjectId || data?.projects?.[0]?.id || "");
     setAmountMode(l.amount_mode || "fixed");
     setFormError("");
   }
@@ -6257,11 +6394,12 @@ function PlanCard({
   current = false,
   disabled = false,
   busy = false,
+  selected = false,
   onChoose,
   buttonText,
 }) {
   return (
-    <article className={`pricing-card ${plan.id === "pro" ? "featured" : ""}`}>
+    <article id={`plan-${plan.id}`} className={`pricing-card ${plan.id === "pro" ? "featured" : ""} ${selected ? "selected-plan" : ""}`}>
       {plan.id === "pro" && <span className="recommended">专业业务</span>}
       <small>{plan.id.toUpperCase()}</small>
       <h2>{plan.name}</h2>
@@ -6269,7 +6407,7 @@ function PlanCard({
         <Money value={plan.price} currency={plan.currency} />
         <span>/ 月</span>
       </div>
-      <p>{current ? "当前生效套餐" : "按月付费，支付确认后开通"}</p>
+      <p>{current ? "当前生效套餐" : plan.id === "free" ? "注册即可使用，无需支付订阅费" : "按月付费，支付确认后开通"}</p>
       <button
         className={`button ${plan.id === "pro" ? "primary" : "secondary"} full`}
         disabled={disabled || busy}
@@ -6314,12 +6452,28 @@ function invoicePath(invoice) {
     : null;
 }
 function Usage() {
-  const { notify, public_demo: publicDemo } = useApp();
-  const { data, loading, error, reload } = useLoad(() =>
-    api("/api/subscription"),
-  );
+  const { notify, public_demo: publicDemo, search } = useApp();
+  const { data, loading, error, reload } = useLoad(async () => {
+    const [subscription, billing] = await Promise.all([api("/api/subscription"), api("/api/billing")]);
+    return { ...subscription, invoices: billing.invoices || [] };
+  });
   const [buying, setBuying] = useState(null);
+  const checkoutKeys = useRef({});
+  const wantedPlan = selectedPlan(search);
+  const requestedPlan = data?.plans?.find(p => p.id === wantedPlan);
+  const pendingInvoice = data?.invoices?.find(i => i.status === "pending");
+  useRefreshOnReturn(reload);
+  useEffect(() => {
+    if (!pendingInvoice) return;
+    const timer = setInterval(reload, 15000);
+    return () => clearInterval(timer);
+  }, [pendingInvoice?.id]);
   async function buy(p) {
+    if (pendingInvoice) {
+      if (pendingInvoice.plan_id === p.id) go(invoicePath(pendingInvoice));
+      else notify("请先完成或在账单历史中取消现有订阅账单。", "error");
+      return;
+    }
     if (
       ["active", "grace"].includes(data?.subscription?.status) &&
       data.subscription.effective_plan_id !== p.id
@@ -6331,7 +6485,7 @@ function Usage() {
     try {
       const r = await mutate("/api/billing/checkout", {
         plan_id: p.id,
-        idempotency_key: crypto.randomUUID(),
+        idempotency_key: checkoutKeys.current[p.id] ||= crypto.randomUUID(),
       });
       go(
         invoicePath({
@@ -6341,6 +6495,7 @@ function Usage() {
       );
     } catch (e) {
       notify(e.message, "error");
+      reload();
     } finally {
       setBuying(null);
     }
@@ -6351,17 +6506,20 @@ function Usage() {
         title="套餐与用量"
         description="查看当前订阅、资源用量，并选择适合的套餐。"
       >
+        <Link to="/merchant/onboarding" className="button primary">继续配置收款<ArrowRight size={15} /></Link>
         <Link to="/merchant/billing" className="button secondary">
           <FileText size={15} />
           账单历史
         </Link>
       </PageHeading>
-      {loading ? (
+      {loading && !data ? (
         <Spinner />
       ) : error ? (
         <ResourceError error={error} onRetry={reload} />
       ) : (
         <>
+          {pendingInvoice && <div className="onboarding-banner subscription-pending-banner"><Clock3 size={24} /><div><b>{pendingInvoice.plan_name}订阅账单等待完成</b><p><Money value={pendingInvoice.amount} currency={pendingInvoice.currency} /> · {pendingInvoice.payment_status === "confirming" ? "已检测到付款，正在等待链上确认" : "继续原账单付款，确认后套餐自动生效"}</p></div><Link to={invoicePath(pendingInvoice)} className="button primary">{pendingInvoice.payment_status === "confirming" ? "查看付款进度" : "查看并继续支付"}<ArrowRight size={15} /></Link><Link to="/merchant/billing" className="table-link">管理账单</Link></div>}
+          {requestedPlan && !pendingInvoice && <div className="info-note compact"><Layers size={18} /><p>你选择了 <b>{requestedPlan.name}</b>，每月 <Money value={requestedPlan.price} currency={requestedPlan.currency} />。请在下方核对额度，点击套餐按钮后再付款，不会自动扣费。</p></div>}
           <section className="panel subscription-card">
             <div className="subscription-heading">
               <span className="plan-overview-icon">
@@ -6503,11 +6661,13 @@ function Usage() {
               <PlanCard
                 key={p.id}
                 plan={p}
+                selected={wantedPlan === p.id}
                 current={data.subscription?.effective_plan_id === p.id}
                 disabled={
                   p.id === "free" ||
                   !data.billing_enabled ||
                   Boolean(buying) ||
+                  Boolean(pendingInvoice && pendingInvoice.plan_id !== p.id) ||
                   (["active", "grace"].includes(data.subscription?.status) &&
                     data.subscription.effective_plan_id !== p.id)
                 }
@@ -6516,6 +6676,8 @@ function Usage() {
                 buttonText={
                   p.id === "free"
                     ? "默认免费计划"
+                    : pendingInvoice
+                      ? pendingInvoice.plan_id === p.id ? pendingInvoice.payment_status === "confirming" ? "查看付款进度" : "继续支付原账单" : "先完成已有账单"
                     : !data.billing_enabled
                       ? "尚未开启收费"
                       : ["active", "grace"].includes(
