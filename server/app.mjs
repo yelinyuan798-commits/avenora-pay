@@ -6,6 +6,7 @@ import { validateWebhookUrl } from "./net.mjs";
 import { registerSecurity } from "./security.mjs";
 import { registerExtensions } from "./extensions.mjs";
 import { registerBilling } from "./billing.mjs";
+import { registerOnboarding } from "./onboarding.mjs";
 
 const pick = (value, keys) =>
   Object.fromEntries(keys.map((k) => [k, value[k]]));
@@ -241,6 +242,7 @@ export function createApp({
   registerSecurity(app, { store });
   registerExtensions(app, { store });
   registerBilling(app, { store });
+  registerOnboarding(app, { store });
   const wrap = (fn) => (req, res, next) =>
     Promise.resolve()
       .then(() => fn(req, res))
